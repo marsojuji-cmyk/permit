@@ -95,10 +95,11 @@ class ReleaseVerifier:
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
 
-    def register(self, escrow: Escrow) -> None:
+    def register(self, escrow: Escrow) -> Receipt:
+        """Register an escrow hold. Returns the AUTHORIZED receipt."""
         with self._lock:
             self._escrows[escrow.escrow_id] = escrow
-        self.ledger.append(
+        return self.ledger.append(
             "AUTHORIZED",
             {
                 "escrow_id": escrow.escrow_id,
