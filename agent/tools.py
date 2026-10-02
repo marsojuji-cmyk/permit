@@ -86,7 +86,7 @@ class SpendTools:
             "cap_cents": permit.cap_cents,
             "reserved_cents": permit.reserved_cents,
             "captured_cents": permit.captured_cents,
-            "remaining_cents": permit.remaining_cents,
+            "remaining_cents": permit.remaining_cents(),
             "revoked": permit.revoked,
         })
 
