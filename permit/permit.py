@@ -60,7 +60,9 @@ class PermitStore:
     """Issues permits, evaluates spend attempts, handles e-stop."""
 
     def __init__(self, ledger: Ledger | None = None):
-        self.ledger = ledger or Ledger()
+        # NOTE: explicit None check — an empty Ledger is falsy via __len__,
+        # so `ledger or Ledger()` would silently discard a passed empty ledger.
+        self.ledger = ledger if ledger is not None else Ledger()
         self._permits: dict[str, Permit] = {}
         self._store_lock = threading.Lock()
 
