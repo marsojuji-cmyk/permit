@@ -59,7 +59,18 @@ def show_receipts(ledger, since: int):
         elif r.event_type == "AUTHORIZED":
             detail = f"${p['amount_cents']/100:.2f} paypal {p['paypal_auth_id'][:14]}..."
         elif r.event_type == "CAPTURED":
-            detail = f"${p['amount_cents']/100:.2f} capture {p['paypal_capture_id'][:14]}..."
+            if "paypal_capture_id" in p:  # settlement layer: the money moved
+                detail = (f"${p['amount_cents']/100:.2f} capture "
+                          f"{p['paypal_capture_id'][:14]}...")
+            else:  # permit layer: reserved -> captured bookkeeping
+                detail = (f"${p['amount_cents']/100:.2f} settled "
+                          f"(remaining ${p['remaining_cents']/100:.2f})")
+        elif r.event_type == "VOIDED":
+            if "escrow_id" in p:  # settlement layer
+                detail = f"escrow {p['escrow_id'][:12]}..."
+            else:  # permit layer: reservation released
+                detail = (f"${p['amount_cents']/100:.2f} released "
+                          f"(remaining ${p['remaining_cents']/100:.2f})")
         print(f"  #{r.seq:02d} {r.event_type:10s} {detail}")
 
 
@@ -96,7 +107,7 @@ def main():
     mark = len(ledger)
     answer = run_agent(
         tools, "Buy the dataset license for $30.00 from dataset_mart.",
-        transcript, replay=args.replay)
+        transcript, replay=args.replay, beat=2)
     show_receipts(ledger, mark)
     print(f"  agent: {answer}")
     print(f"  PayPal authorize calls so far: {len(paypal.authorizations)}")
@@ -108,7 +119,7 @@ def main():
     answer = run_agent(
         tools, "The team wants the premium tier dataset license for $60.00 "
                "from dataset_mart. Buy it if you can.",
-        transcript, replay=args.replay)
+        transcript, replay=args.replay, beat=3)
     show_receipts(ledger, mark)
     print(f"  agent: {answer}")
     print(f"  PayPal authorize calls: {len(paypal.authorizations)} "
@@ -123,9 +134,10 @@ def main():
     )
     tools2 = SpendTools(flow, permit2.permit_id, MERCHANT, CATALOG)
     answer = run_agent(
-        tools2, "Buy api credits for $10.00 from dataset_mart, but do NOT "
-                "deliver yet - just hold the purchase.",
-        transcript, replay=args.replay)
+        tools2, "Buy api credits for $10.00 from dataset_mart. Attempt the "
+                "spend only - do NOT call deliver; the merchant delivers "
+                "separately.",
+        transcript, replay=args.replay, beat=4)
     # find the in-flight escrow
     escrow_id = next(e["escrow_id"] for e in dash.state()["escrows"]
                      if e["permit_id"] == permit2.permit_id
@@ -142,8 +154,10 @@ def main():
     beat(5, "mismatched evidence is REFUSED (no capture)", args.fast)
     mark = len(ledger)
     answer = run_agent(
-        tools, "Buy the quarterly report for $15.00 from dataset_mart.",
-        transcript, replay=args.replay)
+        tools, "Buy the quarterly report for $15.00 from dataset_mart. "
+                "Attempt the spend only - do NOT call deliver; the merchant "
+                "delivers separately.",
+        transcript, replay=args.replay, beat=5)
     escrow_id = next(e["escrow_id"] for e in dash.state()["escrows"]
                      if e["permit_id"] == permit.permit_id
                      and e["state"] == "AUTHORIZED")
@@ -153,7 +167,7 @@ def main():
     print(f"  released={obs['released']} reason={obs['reason']} "
           f"capture_id={obs['capture_id']}")
     print(f"  PayPal capture calls total: {len(paypal.capture_calls)} "
-          f"(only the honest $30)")
+          f"(expected 1: only the honest $30 delivery)")
 
     # -- close-out ------------------------------------------------------------
     ok, reason = ledger.verify_chain()
