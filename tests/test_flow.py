@@ -83,7 +83,8 @@ def test_bad_evidence_refuses_and_never_captures():
     assert not result.released
     assert result.reason.startswith("predicate:")
     assert len(paypal.capture_calls) == 0
-    assert permit.remaining_cents() == 2000  # reservation still held
+    # Refused release cleans up: PayPal hold voided, reservation released.
+    assert permit.remaining_cents() == 5000
 
 
 def test_estop_voids_in_flight_escrow():
