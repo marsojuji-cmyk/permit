@@ -2,18 +2,23 @@
 Sandbox PayPal client: the real REST implementation of PayPalClient.
 
 Flow (Orders API, AUTHORIZE intent):
-    1. create order (intent=AUTHORIZE) -> order_id + approval_url
+    1. create_order(amount) -> (order_id, approval_url)
     2. payer approves via approval_url (browser; sandbox buyer account)
-    3. authorize the order -> authorization_id (the hold)
+    3. authorize_order(order_id) -> authorization_id (the hold)
     4. capture or void the authorization_id
 
-The payer-approval step is interactive, so authorize() raises
-NeedsPayerApproval carrying the approval URL when PayPal reports
-ORDER_NOT_APPROVED. The caller (demo/agent flow) gets approval and retries.
+The payer-approval step is interactive, and the browser UI is not a
+reliable witness: on 2026-10-02 the sandbox checkout page never visually
+advanced past "Continue to Review Order", yet the order had already been
+APPROVED server-side. So approval is confirmed by polling the order's API
+state (order_status / wait_for_approval) - never by what the page shows.
+authorize_order() raises NeedsPayerApproval carrying the approval URL
+when PayPal reports ORDER_NOT_APPROVED.
 
 Endpoints (verified in spike 2026-10-02):
     POST /v1/oauth2/token (Basic client_id:secret)
     POST /v2/checkout/orders
+    GET  /v2/checkout/orders/{id}
     POST /v2/checkout/orders/{id}/authorize
     POST /v2/payments/authorizations/{auth_id}/capture
     POST /v2/payments/authorizations/{auth_id}/void
@@ -27,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import urllib.request
 import urllib.error
 
@@ -45,6 +51,19 @@ class NeedsPayerApproval(Exception):
         self.approval_url = approval_url
 
 
+class ApprovalTimeout(Exception):
+    """Raised when the order is not approved within the polling window."""
+
+    def __init__(self, order_id: str, timeout_s: float, last_status: str):
+        super().__init__(
+            f"order {order_id} not approved after {timeout_s}s "
+            f"(last status: {last_status})"
+        )
+        self.order_id = order_id
+        self.timeout_s = timeout_s
+        self.last_status = last_status
+
+
 class SandboxPayPalClient(PayPalClient):
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
@@ -53,6 +72,7 @@ class SandboxPayPalClient(PayPalClient):
 
     def _http(self, method: str, path: str, body: dict | None = None,
               auth: str | None = None):
+        """Returns (status, body). Empty response bodies come back as None."""
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(BASE + path, data=data, method=method)
         req.add_header("Content-Type", "application/json")
@@ -62,9 +82,14 @@ class SandboxPayPalClient(PayPalClient):
             req.add_header("Authorization", f"Bearer {self._token}")
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                return r.status, json.loads(r.read().decode())
+                return r.status, self._parse(r.read())
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read().decode())
+            return e.code, self._parse(e.read())
+
+    @staticmethod
+    def _parse(raw: bytes):
+        text = raw.decode().strip()
+        return json.loads(text) if text else None
 
     def _ensure_token(self):
         if self._token:
@@ -82,10 +107,12 @@ class SandboxPayPalClient(PayPalClient):
         with urllib.request.urlopen(req, timeout=30) as r:
             self._token = json.loads(r.read().decode())["access_token"]
 
-    def authorize(self, amount_cents: int, merchant_id: str) -> Authorization:
+    # -- order lifecycle (explicit, resumable) ------------------------------
+
+    def create_order(self, amount_cents: int) -> tuple[str, str]:
         """
-        Create an AUTHORIZE-intent order and authorize it.
-        Raises NeedsPayerApproval if the payer hasn't approved yet.
+        Create an AUTHORIZE-intent order. Returns (order_id, approval_url).
+        The caller gets payer approval at the URL, then calls authorize_order.
         """
         self._ensure_token()
         dollars = f"{amount_cents / 100:.2f}"
@@ -94,18 +121,53 @@ class SandboxPayPalClient(PayPalClient):
             "purchase_units": [{"amount": {"currency_code": "CAD", "value": dollars}}],
         })
         assert status in (200, 201), f"order create failed: {status} {order}"
-        order_id = order["id"]
+        approval_url = next(
+            l["href"] for l in order["links"] if l["rel"] == "approve"
+        )
+        return order["id"], approval_url
 
+    def order_status(self, order_id: str) -> str:
+        """
+        The API is the source of truth for approval - not the browser page.
+        Returns the order's status string (e.g. CREATED, APPROVED).
+        """
+        self._ensure_token()
+        status, order = self._http("GET", f"/v2/checkout/orders/{order_id}")
+        assert status == 200, f"order fetch failed: {status} {order}"
+        return order["status"]
+
+    def wait_for_approval(self, order_id: str, timeout_s: float = 120,
+                          poll_s: float = 5) -> str:
+        """
+        Poll the order's API state until it is APPROVED or the timeout
+        elapses. Returns the final status ("APPROVED"); raises
+        ApprovalTimeout otherwise.
+        """
+        deadline = time.monotonic() + timeout_s
+        last = ""
+        while time.monotonic() < deadline:
+            last = self.order_status(order_id)
+            if last == "APPROVED":
+                return last
+            time.sleep(poll_s)
+        raise ApprovalTimeout(order_id, timeout_s, last)
+
+    def authorize_order(self, order_id: str, amount_cents: int,
+                        merchant_id: str) -> Authorization:
+        """
+        Authorize an existing (already approved) order -> the hold.
+        Raises NeedsPayerApproval if the order isn't approved yet; the
+        caller should get approval and retry this same method - never
+        create a second order for the same spend.
+        """
+        self._ensure_token()
         status, auth_body = self._http(
             "POST", f"/v2/checkout/orders/{order_id}/authorize", {})
         if status == 422 and any(
             d.get("issue") == "ORDER_NOT_APPROVED"
-            for d in auth_body.get("details", [])
+            for d in (auth_body or {}).get("details", [])
         ):
-            approval_url = next(
-                l["href"] for l in order["links"] if l["rel"] == "approve"
-            )
-            raise NeedsPayerApproval(order_id, approval_url)
+            raise NeedsPayerApproval(order_id, self._approval_url(order_id))
         assert status in (200, 201), f"authorize failed: {status} {auth_body}"
 
         # The authorization lives in purchase_units[0].payments.authorizations[0].
@@ -118,6 +180,23 @@ class SandboxPayPalClient(PayPalClient):
             status="AUTHORIZED",
             created_at=auth.get("create_time", ""),
         )
+
+    def _approval_url(self, order_id: str) -> str:
+        _, order = self._http("GET", f"/v2/checkout/orders/{order_id}")
+        return next(l["href"] for l in order["links"] if l["rel"] == "approve")
+
+    # -- PayPalClient interface ----------------------------------------------
+
+    def authorize(self, amount_cents: int, merchant_id: str) -> Authorization:
+        """
+        Convenience: create an order and authorize it in one call.
+        Raises NeedsPayerApproval with (order_id, approval_url) when the
+        payer hasn't approved yet; the caller then calls authorize_order()
+        with the same order_id after approval - it must NOT call this
+        method again (that would create a second order and double-reserve).
+        """
+        order_id, _ = self.create_order(amount_cents)
+        return self.authorize_order(order_id, amount_cents, merchant_id)
 
     def capture(self, auth_id: str, amount_cents: int,
                 idempotency_key: str) -> Capture:
@@ -151,5 +230,6 @@ class SandboxPayPalClient(PayPalClient):
         self._ensure_token()
         status, body = self._http(
             "POST", f"/v2/payments/authorizations/{auth_id}/void", {})
+        # Void answers 204 with an empty body on success.
         assert status in (200, 201, 204), f"void failed: {status} {body}"
         return Void(auth_id=auth_id, status="VOIDED")

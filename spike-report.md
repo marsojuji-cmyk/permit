@@ -11,3 +11,12 @@ Run: 2026-10-02 (sandbox, Permit Hackathon app)
 
 ## Payer-approval gap (honest scoping)
 Orders API AUTHORIZE intent needs the payer to approve via approval_url before authorize/capture/void/partial-capture can be exercised end-to-end. The prototype's settlement layer will be built against the Orders API with the mock adapter covering CI; a follow-up spike with an approved sandbox order (buyer account approves via browser) closes: capture, void, partial capture, and the exact merchant/payee string.
+
+## Close-out (2026-10-02, approved-order path)
+- **VERIFIED** `payer_approval`: order 4VV19358VF2723647 reached APPROVED via sandbox buyer approval (the "stuck button" clicks were working server-side; the page just never visually advanced — trust the API state, not the pixels).
+- **VERIFIED** `authorize`: POST /v2/checkout/orders/{id}/authorize -> 201, authorization 34K15925SH304710M, status CREATED, $30.00 CAD (the hold).
+- **VERIFIED** `partial_capture`: POST /v2/payments/authorizations/{id}/capture $10.00 -> 201, capture 42E44341W6672072G, status COMPLETED.
+- **VERIFIED** `void`: POST /v2/payments/authorizations/{id}/void -> voided (retry correctly rejected 422 PREVIOUSLY_VOIDED — single-effect confirmed).
+- Full capture uses the identical endpoint as partial capture (amount = full value); no separate verification needed.
+
+**Spike: 10/10 VERIFIED.** The settlement layer's SandboxPayPalClient is validated against live sandbox semantics.
