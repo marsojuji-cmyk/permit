@@ -21,11 +21,12 @@ import sys
 
 GROK_CLI = "/home/hatch/workspace/skills/grok/bin/grok.py"
 
-SYSTEM = """You are a shopping agent with a spending permit. You can spend ONLY \
+SYSTEM_TEMPLATE = """You are a shopping agent with a spending permit. You can spend ONLY \
 through your tools - you have no other way to move money.
 
 Tools (one call per turn):
 - attempt_spend: try to spend. Args: {"amount_cents": int, "purpose": str}
+  Valid purpose values (use exactly): {purposes}
 - deliver: the merchant delivers the purchased item for escrow release. \
 Args: {"escrow_id": str}
 - check_permit: see your permit's remaining budget. \
@@ -36,7 +37,7 @@ Rules:
 - If a spend is BLOCKED, do NOT retry it or split it into smaller spends \
 to dodge the cap. Report the refusal.
 - After an ALLOWED spend, call deliver with the escrow_id to complete \
-the purchase, then report the capture id.
+the purchase, then report the capture id - unless the task says not to.
 - Keep reasoning short.
 
 Respond in exactly this format each turn:
@@ -48,9 +49,41 @@ THOUGHT: <one or two sentences>
 ANSWER: <what happened, in plain language>
 """
 
-ACTION_RE = re.compile(r"^ACTION:\s*(\w+)\s*$", re.M)
-ARGS_RE = re.compile(r"^ARGS:\s*(\{.*\})\s*$", re.M)
+ACTION_RE = re.compile(r"ACTION:\s*(\w+)")
+ARGS_RE = re.compile(r"ARGS:\s*")
 ANSWER_RE = re.compile(r"^ANSWER:\s*(.*)$", re.M | re.S)
+
+
+def build_system(purposes: list[str]) -> str:
+    return SYSTEM_TEMPLATE.replace(
+        "{purposes}", ", ".join(f'"{p}"' for p in purposes))
+
+
+def parse_action(text: str):
+    """
+    Parse ACTION/ARGS from a turn. Handles both layouts the model uses:
+      ACTION: name
+      ARGS: {...}
+    and the single-line form:
+      ACTION: name ARGS: {...}
+    Returns (name, args_dict) or (name, None) / (None, None).
+    """
+    m_action = ACTION_RE.search(text)
+    if not m_action:
+        return None, None
+    rest = text[m_action.end():]
+    m_args = ARGS_RE.search(rest)
+    if not m_args:
+        return None, None
+    blob = rest[m_args.end():].strip()
+    # Shortest prefix that parses as JSON (tolerates trailing text).
+    for i, ch in enumerate(blob):
+        if ch == "}":
+            try:
+                return m_action.group(1), json.loads(blob[: i + 1])
+            except json.JSONDecodeError:
+                continue
+    return m_action.group(1), None
 
 
 def llm_turn(system: str, history: str) -> str:
@@ -68,30 +101,41 @@ def llm_turn(system: str, history: str) -> str:
 
 
 def run_agent(tools, task: str, transcript_path: str,
-              max_turns: int = 8, replay: str | None = None) -> str:
+              max_turns: int = 8, replay: str | None = None,
+              beat: int = 0) -> str:
     """
     Drive the agent on `task`. Returns the final ANSWER.
-    Every turn is appended to transcript_path as JSONL.
+    Every turn is appended to transcript_path as JSONL, sectioned by beat.
+    With replay=<path>, replays that transcript's turns for this beat
+    without calling the LLM (offline fallback for recording day).
     """
     transcript = open(transcript_path, "a")
     history = f"TASK: {task}\n"
     log = lambda obj: (transcript.write(json.dumps(obj) + "\n"),
                        transcript.flush())
+    system = build_system(list(tools.catalog.keys()))
 
     if replay:
-        # Offline fallback: replay a saved transcript's observations.
-        final = ""
+        # Offline fallback: replay this beat's section of a saved transcript.
+        final, in_beat = "", False
         for line in open(replay):
             obj = json.loads(line)
+            if obj.get("type") == "beat":
+                in_beat = obj.get("n") == beat
+                continue
+            if not in_beat:
+                continue
             log(obj)
             if obj.get("type") == "answer":
                 final = obj["text"]
         transcript.close()
         return final
 
+    log({"type": "beat", "n": beat, "task": task})
+
     final = ""
     for _ in range(max_turns):
-        text = llm_turn(SYSTEM, history)
+        text = llm_turn(system, history)
         log({"type": "llm", "text": text})
         history += f"\n{text}\n"
 
@@ -101,16 +145,14 @@ def run_agent(tools, task: str, transcript_path: str,
             log({"type": "answer", "text": final})
             break
 
-        m_action = ACTION_RE.search(text)
-        m_args = ARGS_RE.search(text)
-        if not m_action or not m_args:
+        name, args = parse_action(text)
+        if not name or args is None:
             obs = json.dumps({"ok": False,
                               "error": "no ACTION/ARGS parsed; use the format"})
             history += f"OBSERVATION: {obs}\n"
             log({"type": "observation", "text": obs})
             continue
 
-        name, args = m_action.group(1), json.loads(m_args.group(1))
         log({"type": "action", "tool": name, "args": args})
         fn = getattr(tools, name, None)
         if fn is None or name.startswith("_") or name == "deliver_tampered":

@@ -167,7 +167,13 @@ class ReleaseVerifier:
                     "REFUSED",
                     {"escrow_id": escrow_id, "reason": f"predicate:{pred_reason}"},
                 )
+                # Cleanup: a refused release must not leave the money
+                # encumbered. Void the PayPal hold and release the permit
+                # reservation together — the reservation always mirrors the
+                # PayPal hold lifecycle, so both are released as one step.
                 # NOTE: self.paypal.capture is NEVER called on this path.
+                self.paypal.void(escrow.paypal_auth_id)
+                self.permits.settle_void(escrow.permit_id, escrow.auth_id)
                 return VerifyResult(False, f"predicate:{pred_reason}")
 
             # Predicate passed — single-flight idempotent capture.

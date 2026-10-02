@@ -82,10 +82,15 @@ def test_n1_hash_mismatch_no_capture():
     # REFUSED receipt exists.
     refused = [r for r in verifier.ledger.receipts() if r.event_type == "REFUSED"]
     assert len(refused) == 1
-    # Permit reservation untouched (still reserved, not captured).
+    # The refused release must not leave money encumbered: the PayPal hold
+    # is voided and the permit reservation released together.
+    assert escrow.paypal_auth_id in paypal.voids
+    voided = [r for r in verifier.ledger.receipts() if r.event_type == "VOIDED"]
+    assert len(voided) == 1
     permit = permits.get(escrow.permit_id)
-    assert permit.reserved_cents == 3000
+    assert permit.reserved_cents == 0
     assert permit.captured_cents == 0
+    assert permit.remaining_cents() == 5000
 
 
 def test_n2_worker_signature_without_acceptance_no_capture():
