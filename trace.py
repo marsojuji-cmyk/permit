@@ -120,12 +120,15 @@ def main():
         from settlement.verifier import PredicateType, ReleaseVerifier
 
         class StrictSpy(PayPalClient):
-            def authorize(self, amount_cents, merchant_id):
+            merchant_account_id = None
+            def authorize(self, amount_cents, merchant_id, idempotency_key=None):
                 raise AssertionError("GATE FAILURE: PayPal.authorize called on a blocked attempt")
             def capture(self, auth_id, amount_cents, idempotency_key):
                 raise AssertionError("GATE FAILURE: PayPal.capture called on a blocked attempt")
             def void(self, auth_id):
                 raise AssertionError("GATE FAILURE: PayPal.void called on a blocked attempt")
+            def get_authorization(self, auth_id):
+                raise AssertionError("GATE FAILURE: PayPal.get_authorization called on a blocked attempt")
 
         lg = Ledger()
         ps = PermitStore(ledger=lg)

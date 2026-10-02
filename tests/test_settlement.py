@@ -170,3 +170,105 @@ def test_only_verifier_calls_capture():
         and n.func.attr == "capture"
     ]
     assert len(calls) == 1, "exactly one capture call site must exist (the verifier)"
+
+
+# ---------------------------------------------------------------------------
+# P1 settlement regression tests (outside-witness findings, 2026-10-02)
+# ---------------------------------------------------------------------------
+
+
+def test_p1_4_predicate_fail_void_timeout_cleanup_pending_then_retry():
+    """P1-4: a void timeout on the predicate-fail path must NOT release the
+    reservation silently. The escrow goes CLEANUP_PENDING with the
+    reservation still held; retry_cleanup() finishes the job once the
+    provider is reachable again."""
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    paypal.inject_void_timeout = True
+    result = verifier.verify_and_capture(
+        "esc_1", Evidence(delivered_bytes=b"tampered work product")
+    )
+    assert not result.released
+    assert result.reason == "predicate:hash_mismatch"
+    assert paypal.capture_calls == [], "capture must NEVER be called on N1"
+    assert escrow.state == "CLEANUP_PENDING"
+    # The hold may still be live: the reservation is NOT released yet.
+    assert escrow.paypal_auth_id not in paypal.voids
+    permit = permits.get(escrow.permit_id)
+    assert permit.reserved_cents == 3000, "obligation retained while void unconfirmed"
+    assert permit.captured_cents == 0
+    # Provider recovers: retry_cleanup finishes the void + releases.
+    paypal.inject_void_timeout = False
+    assert verifier.retry_cleanup("esc_1") is True
+    assert escrow.state == "VOIDED"
+    assert escrow.paypal_auth_id in paypal.voids
+    permit = permits.get(escrow.permit_id)
+    assert permit.reserved_cents == 0, "reservation released after cleanup"
+    assert permit.captured_cents == 0
+    voided = [r for r in verifier.ledger.receipts() if r.event_type == "VOIDED"]
+    assert len(voided) == 1
+
+
+def test_p1_4b_broken_chain_attempts_void():
+    """P1-4b: a broken ledger chain refuses capture but must not leave the
+    money encumbered — the verifier attempts the void. Void succeeds →
+    VOIDED + reservation released, capture never called."""
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    receipts = verifier.ledger.receipts()
+    tampered = receipts[1]
+    object.__setattr__(tampered, "payload", {**tampered.payload, "amount_cents": 1})
+    verifier.ledger._receipts[1] = tampered
+    result = verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+    assert not result.released
+    assert result.reason == "broken_chain"
+    assert paypal.capture_calls == []
+    # The void WAS attempted (the P1-4b fix).
+    assert escrow.paypal_auth_id in paypal.voids
+    assert escrow.state == "VOIDED"
+    permit = permits.get(escrow.permit_id)
+    assert permit.reserved_cents == 0, "reservation released on broken-chain void"
+    assert permit.captured_cents == 0
+    voided = [r for r in verifier.ledger.receipts() if r.event_type == "VOIDED"]
+    assert len(voided) == 1
+
+
+def test_p1_4b_broken_chain_void_timeout_cleanup_pending():
+    """P1-4b companion: if the broken-chain void also times out, the escrow
+    goes CLEANUP_PENDING instead of pretending the hold is gone."""
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    receipts = verifier.ledger.receipts()
+    tampered = receipts[1]
+    object.__setattr__(tampered, "payload", {**tampered.payload, "amount_cents": 1})
+    verifier.ledger._receipts[1] = tampered
+    paypal.inject_void_timeout = True
+    result = verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+    assert not result.released
+    assert result.reason == "broken_chain"
+    assert escrow.state == "CLEANUP_PENDING"
+    permit = permits.get(escrow.permit_id)
+    assert permit.reserved_cents == 3000
+    pending = [
+        r for r in verifier.ledger.receipts() if r.event_type == "CLEANUP_PENDING"
+    ]
+    assert len(pending) == 1
+
+
+def test_p1_5_capture_pending_stays_unknown_obligation_retained():
+    """P1-5: a PENDING capture is not a completed capture. The escrow goes
+    UNKNOWN (never CAPTURED), the obligation is retained (reservation
+    still held), and reconcile() is the only way forward."""
+    verifier, paypal, permits, escrow, artifact = _setup(PredicateType.D)
+    paypal.capture_status = "PENDING"
+    result = verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+    assert not result.released
+    assert result.reason == "capture_pending"
+    assert escrow.state == "UNKNOWN"
+    assert escrow.state != "CAPTURED"
+    permit = permits.get(escrow.permit_id)
+    assert permit.captured_cents == 0, "no captured accounting on PENDING"
+    assert permit.reserved_cents == 3000, "obligation retained while pending"
+    unknown = [r for r in verifier.ledger.receipts() if r.event_type == "UNKNOWN"]
+    assert len(unknown) == 1
+    assert unknown[0].payload["reason"] == "capture_pending"
+    # The UNKNOWN escrow refuses further capture attempts outright.
+    r2 = verifier.verify_and_capture("esc_1", Evidence(delivered_bytes=artifact))
+    assert r2.reason == "unknown_reconcile_first"
