@@ -1,5 +1,5 @@
 """
-Permit five-beat demo (mock mode: no credentials, no network).
+Permit six-beat demo (mock mode: no credentials, no network).
 
 The human principal grants the permit; a REAL LLM agent (Grok, ReAct loop)
 decides what to spend. The dashboard (http://127.0.0.1:8471) shows live
@@ -13,9 +13,13 @@ Beats:
   4. New permit, agent holds $10 in flight -> human hits E-STOP ->
      permit revoked, escrow voided -> release refused.
   5. Agent holds $15 -> worker submits tampered bytes -> REFUSED, no capture.
+  6. Agent holds $25 -> the capture applies at PayPal but the response is
+     dropped -> escrow goes UNKNOWN (never optimistically claimed) ->
+     reconcile() converges to the provider truth: CAPTURED, exactly one
+     capture on the rail, no double charge.
 
 Usage:
-  python3 demo_five_beat.py [--replay TRANSCRIPT] [--fast] [--port 8471]
+  python3 demo_six_beat.py [--replay TRANSCRIPT] [--fast] [--port 8471]
   --replay re-runs a saved agent transcript without calling the LLM.
 """
 
@@ -65,6 +69,11 @@ def show_receipts(ledger, since: int):
             else:  # permit layer: reserved -> captured bookkeeping
                 detail = (f"${p['amount_cents']/100:.2f} settled "
                           f"(remaining ${p['remaining_cents']/100:.2f})")
+        elif r.event_type == "UNKNOWN":
+            detail = (f"escrow {p['escrow_id'][:12]}... "
+                      f"reason={p.get('reason', '')}")
+        elif r.event_type == "CLEANUP_PENDING":
+            detail = f"escrow {p['escrow_id'][:12]}... void unconfirmed"
         elif r.event_type == "VOIDED":
             if "escrow_id" in p:  # settlement layer
                 detail = f"escrow {p['escrow_id'][:12]}..."
@@ -168,6 +177,36 @@ def main():
           f"capture_id={obs['capture_id']}")
     print(f"  PayPal capture calls total: {len(paypal.capture_calls)} "
           f"(expected 1: only the honest $30 delivery)")
+
+    # -- beat 6: dropped provider response ------------------------------------
+    beat(6, "dropped capture response: UNKNOWN -> reconcile -> consistent",
+         args.fast)
+    mark = len(ledger)
+    permit3, _ = permits.grant(
+        agent_id="demo_agent", cap_cents=5000, allowlist=[MERCHANT],
+        expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    tools3 = SpendTools(flow, permit3.permit_id, MERCHANT, CATALOG)
+    obs = json.loads(tools3.attempt_spend(2500, "api credits"))
+    assert obs["ok"], obs
+    escrow_id = obs["escrow_id"]
+    print(f"  escrow {escrow_id[:14]}... authorized; merchant delivers honestly")
+    # The capture applies at PayPal, but the response is lost on the wire.
+    # The escrow must go UNKNOWN — never optimistically claimed either way.
+    paypal.inject_capture_timeout = "after_apply"
+    obs = json.loads(tools3.deliver(escrow_id))
+    paypal.inject_capture_timeout = None
+    print(f"  released={obs['released']} reason={obs['reason']} "
+          f"(escrow state: UNKNOWN — not captured, not failed)")
+    print(f"  reconciling against the provider's truth...")
+    rec = verifier.reconcile(escrow_id)
+    cap = rec.capture.capture_id[:14] + "..." if rec.capture else None
+    print(f"  reconcile: resolved={rec.resolved} outcome={rec.outcome} "
+          f"capture={cap}")
+    show_receipts(ledger, mark)
+    print(f"  PayPal capture calls total: {len(paypal.capture_calls)} "
+          f"(exactly one capture reached PayPal — the idempotency key "
+          f"prevented a second charge)")
 
     # -- close-out ------------------------------------------------------------
     ok, reason = ledger.verify_chain()

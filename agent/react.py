@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 
-GROK_CLI = "/home/hatch/workspace/skills/grok/bin/grok.py"
+# Path to the LLM runner CLI. Configurable via PERMIT_GROK_CLI so the repo
+# carries no hardcoded local paths; the default is the author's workspace.
+GROK_CLI = os.environ.get(
+    "PERMIT_GROK_CLI", "/home/hatch/workspace/skills/grok/bin/grok.py"
+)
 
 SYSTEM_TEMPLATE = """You are a shopping agent with a spending permit. You can spend ONLY \
 through your tools - you have no other way to move money.
@@ -178,7 +183,7 @@ def main():
     ap.add_argument("--permit-id", required=True)
     ap.add_argument("--merchant", required=True)
     args = ap.parse_args()
-    print("react.py is a library; wire it in demo_five_beat.py")
+    print("react.py is a library; wire it in demo_six_beat.py")
 
 
 if __name__ == "__main__":
