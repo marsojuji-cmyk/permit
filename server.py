@@ -5,8 +5,15 @@ Permit service: a minimal HTTP server exposing the core verbs.
     issue permit      POST /api/permits            {agent_id, cap_cents, allowlist, expiry_hours}
     permit state      GET  /api/permits/<permit_id>
     check authority   POST /api/permits/<permit_id>/check   {amount_cents, merchant_id}
+                      (read-only: reserves nothing, writes no receipt)
     spend (allowed)   POST /api/permits/<permit_id>/spend   {amount_cents, merchant_id, predicate, artifact_hash}
+                      sandbox mode may answer 202 approval_required with
+                      {operation_id, order_id, approval_url}; the reservation
+                      stays held and the SAME order is resumed via:
+    resume approval   POST /api/operations/<operation_id>/resume   {}
     release escrow    POST /api/escrows/<escrow_id>/release {delivered_bytes_b64} | {acceptance_signature}
+    reconcile unknown POST /api/escrows/<escrow_id>/reconcile   {}
+    retry cleanup     POST /api/escrows/<escrow_id>/retry-cleanup {}
     e-stop            POST /api/permits/<permit_id>/estop   {}
     ledger            GET  /api/ledger
     debug (mock only) GET  /debug/paypal -> mock call counts
@@ -31,7 +38,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from permit.flow import SpendPipeline
+from permit.flow import ApprovalRequired, SpendPipeline
 from permit.ledger import Ledger
 from permit.permit import PermitStore
 from settlement.paypal_client import MockPayPalClient
@@ -50,6 +57,16 @@ paypal = None          # set in main()
 verifier = None        # set in main()
 flow = None            # set in main()
 MOCK_MODE = True
+
+# Approval-continuation registry: operation_id -> ApprovalRequired.
+# Retains the operation, the PayPal order, and the cap reservation
+# (the reservation stays held from the original spend's check()).
+# Resume re-authorizes the SAME order — never a second one.
+import threading
+import uuid as _uuid
+
+PENDING_OPS: dict[str, ApprovalRequired] = {}
+PENDING_OPS_LOCK = threading.Lock()
 
 
 def receipt_summary(r):
@@ -143,24 +160,73 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/permits/([\w-]+)/check", self.path)
         if m:
             try:
-                amount = int(body["amount_cents"]); merchant = body["merchant_id"]
-            except (KeyError, TypeError, ValueError):
+                raw_amount = body["amount_cents"]; merchant = body["merchant_id"]
+            except (KeyError, TypeError):
                 return self._error(400, "need amount_cents, merchant_id")
-            check = permits.check(m.group(1), amount, merchant)
+            if isinstance(raw_amount, bool) or not isinstance(raw_amount, int) or raw_amount <= 0:
+                return self._error(400, "amount_cents must be a positive integer")
+            amount = raw_amount
+            # Read-only eligibility: no reservation, no receipt.
+            check = permits.eligible(m.group(1), amount, merchant)
             return self._send(200, {
                 "allowed": check.allowed, "reason": check.reason,
-                "receipt": receipt_summary(check.receipt),
             })
 
         m = re.fullmatch(r"/api/permits/([\w-]+)/spend", self.path)
         if m:
             try:
-                amount = int(body["amount_cents"]); merchant = body["merchant_id"]
+                raw_amount = body["amount_cents"]; merchant = body["merchant_id"]
                 predicate = PredicateType(body.get("predicate", "delivery_hash"))
                 artifact_hash = body["artifact_hash"]
             except (KeyError, TypeError, ValueError):
                 return self._error(400, "need amount_cents, merchant_id, predicate, artifact_hash")
-            attempt = flow.spend(m.group(1), amount, merchant, predicate, artifact_hash)
+            if isinstance(raw_amount, bool) or not isinstance(raw_amount, int) or raw_amount <= 0:
+                return self._error(400, "amount_cents must be a positive integer")
+            amount = raw_amount
+            try:
+                attempt = flow.spend(m.group(1), amount, merchant, predicate, artifact_hash)
+            except ApprovalRequired as appr:
+                # Buyer approval needed: the cap reservation stays held and
+                # the operation is retained for resume. 202, not an error.
+                operation_id = f"op_{_uuid.uuid4().hex[:12]}"
+                with PENDING_OPS_LOCK:
+                    PENDING_OPS[operation_id] = appr
+                return self._send(202, {
+                    "status": "approval_required",
+                    "operation_id": operation_id,
+                    "order_id": appr.order_id,
+                    "approval_url": appr.approval_url,
+                    "reservation": "held",
+                    "next": f"POST /api/operations/{operation_id}/resume after payer approval",
+                })
+            return self._send(200, {
+                "allowed": attempt.allowed, "reason": attempt.reason,
+                "escrow_id": attempt.escrow_id,
+                "receipts": [receipt_summary(r) for r in attempt.receipts],
+            })
+
+        m = re.fullmatch(r"/api/operations/([\w-]+)/resume", self.path)
+        if m:
+            operation_id = m.group(1)
+            with PENDING_OPS_LOCK:
+                appr = PENDING_OPS.get(operation_id)
+            if appr is None:
+                return self._error(404, "unknown_operation")
+            try:
+                attempt = flow.resume_operation(appr)
+            except ApprovalRequired as still:
+                # Still not approved — keep the operation retained.
+                with PENDING_OPS_LOCK:
+                    PENDING_OPS[operation_id] = still
+                return self._send(202, {
+                    "status": "approval_required",
+                    "operation_id": operation_id,
+                    "order_id": still.order_id,
+                    "approval_url": still.approval_url,
+                    "reservation": "held",
+                })
+            with PENDING_OPS_LOCK:
+                PENDING_OPS.pop(operation_id, None)
             return self._send(200, {
                 "allowed": attempt.allowed, "reason": attempt.reason,
                 "escrow_id": attempt.escrow_id,
@@ -196,6 +262,21 @@ class Handler(BaseHTTPRequestHandler):
                 "capture_id": result.capture.capture_id if result.capture else None,
             })
 
+        m = re.fullmatch(r"/api/escrows/([\w-]+)/reconcile", self.path)
+        if m:
+            escrow_id = m.group(1)
+            rec = verifier.reconcile(escrow_id)
+            return self._send(200, {
+                "resolved": rec.resolved, "outcome": rec.outcome,
+                "capture_id": rec.capture.capture_id if rec.capture else None,
+                "receipt": receipt_summary(rec.receipt) if rec.receipt else None,
+            })
+
+        m = re.fullmatch(r"/api/escrows/([\w-]+)/retry-cleanup", self.path)
+        if m:
+            cleared = verifier.retry_cleanup(m.group(1))
+            return self._send(200, {"cleanup_cleared": cleared})
+
         return self._error(404, "not_found")
 
 
@@ -215,9 +296,13 @@ def main():
         client_secret = os.environ.get("PERMIT_PAYPAL_CLIENT_SECRET")
         if not client_id or not client_secret:
             raise SystemExit("sandbox mode needs PERMIT_PAYPAL_CLIENT_ID and PERMIT_PAYPAL_CLIENT_SECRET")
-        paypal = SandboxPayPalClient(client_id, client_secret)
+        merchant_id = os.environ.get("PERMIT_PAYPAL_MERCHANT_ID")
+        paypal = SandboxPayPalClient(client_id, client_secret,
+                                     merchant_account_id=merchant_id)
         MOCK_MODE = False
-        print("permit: sandbox rail armed")
+        print("permit: sandbox rail armed"
+              + (f" (merchant bound to {merchant_id})" if merchant_id
+                 else " (WARNING: no PERMIT_PAYPAL_MERCHANT_ID — merchant binding disabled)"))
     else:
         paypal = MockPayPalClient()
         print("permit: mock rail (no network, no credentials)")

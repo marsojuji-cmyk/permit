@@ -7,7 +7,7 @@ reflects live state (polls /api/state every second). The e-stop button
 calls flow.estop() for real.
 
 Run standalone for dev: python3 dashboard/server.py  (empty demo state)
-The five-beat demo starts it in-process with live objects.
+The six-beat demo starts it in-process with live objects.
 """
 
 from __future__ import annotations

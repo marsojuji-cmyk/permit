@@ -11,6 +11,7 @@ import pytest
 
 from settlement.sandbox_client import (
     ApprovalTimeout,
+    MerchantMismatch,
     NeedsPayerApproval,
     SandboxPayPalClient,
 )
@@ -27,6 +28,9 @@ ORDER = {
 
 AUTH_BODY = {
     "purchase_units": [{
+        # Provider trust binding (P1-2): authorize_order() checks these.
+        "payee": {"merchant_id": "ACCOUNT_X"},
+        "amount": {"currency_code": "CAD", "value": "30.00"},
         "payments": {"authorizations": [{
             "id": "AUTH999",
             "create_time": "2026-10-02T00:00:00Z",
@@ -41,7 +45,7 @@ def make_client(responses):
     client._token = "tok"  # skip the OAuth call
     calls = []
 
-    def fake_http(method, path, body=None, auth=None):
+    def fake_http(method, path, body=None, auth=None, **kwargs):
         calls.append((method, path))
         return responses.pop(0)
 
@@ -71,6 +75,57 @@ def test_authorize_order_on_approved_order():
     assert auth.amount_cents == 3000
     assert auth.merchant_id == "merchant_x"
     assert c._calls == [("POST", "/v2/checkout/orders/ORDER123/authorize")]
+
+
+def test_authorize_order_merchant_mismatch():
+    """P1-2: the provider's payee must match the trusted merchant account.
+
+    merchant_account_id="ACCOUNT_X" is trusted; the stubbed authorize
+    response carries payee.merchant_id="ACTUAL_OTHER" -> MerchantMismatch,
+    fail closed. No hold is usable.
+    """
+    import copy
+
+    mismatch_body = copy.deepcopy(AUTH_BODY)
+    mismatch_body["purchase_units"][0]["payee"]["merchant_id"] = "ACTUAL_OTHER"
+
+    client = SandboxPayPalClient(
+        "id", "secret", merchant_account_id="ACCOUNT_X"
+    )
+    client._token = "tok"  # skip the OAuth call
+    seen_headers = []
+
+    def fake_http(method, path, body=None, auth=None, **kwargs):
+        seen_headers.append(kwargs.get("request_id"))
+        return 201, mismatch_body
+
+    client._http = fake_http
+    with pytest.raises(MerchantMismatch):
+        client.authorize_order("ORDER123", 3000, "merchant_x")
+
+
+def test_authorize_order_trusted_payee_passes():
+    """Same stubbed body with the trusted payee authorizes normally."""
+    c = SandboxPayPalClient("id", "secret", merchant_account_id="ACCOUNT_X")
+    c._token = "tok"
+    c._http = lambda method, path, body=None, auth=None, **kw: (201, AUTH_BODY)
+    auth = c.authorize_order("ORDER123", 3000, "merchant_x")
+    assert auth.auth_id == "AUTH999"
+
+
+def test_authorize_order_amount_mismatch():
+    """P1-2 companion: a wrong currency or value also raises MerchantMismatch."""
+    import copy
+
+    bad_body = copy.deepcopy(AUTH_BODY)
+    bad_body["purchase_units"][0]["amount"] = {
+        "currency_code": "USD", "value": "30.00"
+    }
+    c = SandboxPayPalClient("id", "secret", merchant_account_id="ACCOUNT_X")
+    c._token = "tok"
+    c._http = lambda method, path, body=None, auth=None, **kw: (201, bad_body)
+    with pytest.raises(MerchantMismatch):
+        c.authorize_order("ORDER123", 3000, "merchant_x")
 
 
 def test_authorize_order_unapproved_raises_with_same_order_id():
