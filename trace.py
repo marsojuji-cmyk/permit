@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""
+trace.py — start the Permit service and capture runnable evidence:
+
+  1. an allowed payment flows through the 4-clause gate (issue -> check -> spend -> release -> capture)
+  2. an over-authority attempt is BLOCKED and never touches the PayPal client:
+       - via the running server: /debug/paypal call counts unchanged across the block
+       - in-process: an assertion-level spy whose authorize() raises AssertionError if called;
+         the gate must return BLOCKED without ever calling it
+  3. e-stop voids in-flight escrows; post-e-stop release is refused
+
+The gate under test is the real gate (permit/permit.py, permit/flow.py) —
+nothing here is mocked except the PayPal rail itself. Any assertion failure
+exits non-zero. Output doubles as the run's evidence log.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+PORT = 8741
+BASE = f"http://127.0.0.1:{PORT}"
+
+
+def req(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(BASE + path, data=data, method=method,
+                               headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(r, timeout=10) as resp:
+        return resp.status, json.loads(resp.read().decode())
+
+
+def show(tag, obj):
+    print(f"[{tag}] {json.dumps(obj)}")
+
+
+def main():
+    srv = subprocess.Popen(
+        [sys.executable, str(HERE / "server.py"), "--port", str(PORT)],
+        cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        # wait for the listener
+        for _ in range(50):
+            try:
+                req("GET", "/api/ledger")
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise SystemExit("server did not start")
+
+        merchant = "trace_merchant"
+        artifact = b"trace deliverable " + datetime.now(timezone.utc).isoformat().encode()
+        digest = hashlib.sha256(artifact).hexdigest()
+
+        # ---- 1. issue + check + spend (allowed) ---------------------------
+        # NOTE: an ALLOWED check() RESERVES cap (cumulative reservation), so
+        # the trace accounts for it: $100 cap, check $30 (reserves), spend $30.
+        _, grant = req("POST", "/api/permits", {
+            "agent_id": "trace_agent", "cap_cents": 10000,
+            "allowlist": [merchant], "expiry_hours": 1})
+        pid = grant["permit_id"]
+        show("grant", {"permit_id": pid, "receipt_seq": grant["receipt"]["seq"]})
+
+        _, check = req("POST", f"/api/permits/{pid}/check",
+                       {"amount_cents": 3000, "merchant_id": merchant})
+        show("check", {"allowed": check["allowed"], "reason": check["reason"]})
+        assert check["allowed"] and check["reason"] == "allowed", "check should pass"
+
+        _, spend = req("POST", f"/api/permits/{pid}/spend", {
+            "amount_cents": 3000, "merchant_id": merchant,
+            "predicate": "delivery_hash", "artifact_hash": digest})
+        show("spend", {"allowed": spend["allowed"], "reason": spend["reason"],
+                       "escrow_id": spend["escrow_id"]})
+        assert spend["allowed"] and spend["escrow_id"], "spend should be allowed"
+        escrow_id = spend["escrow_id"]
+
+        _, state = req("GET", f"/api/permits/{pid}")
+        show("permit-state", {"reserved_cents": state["reserved_cents"],
+                              "remaining_cents": state["remaining_cents"]})
+        assert state["remaining_cents"] == 4000  # 10000 - 3000(check) - 3000(spend)
+
+        _, paypal = req("GET", "/debug/paypal")
+        show("paypal-after-allowed", paypal)
+        assert paypal["authorizations"] == 1, "exactly one PayPal authorize expected"
+
+        # ---- 2. blocked path: over-authority attempt -----------------------
+        # remaining is $40 (100 - 30 check - 30 spend); $50 must block.
+        _, paypal_before = req("GET", "/debug/paypal")
+        _, blocked = req("POST", f"/api/permits/{pid}/spend", {
+            "amount_cents": 5000, "merchant_id": merchant,
+            "predicate": "delivery_hash", "artifact_hash": digest})
+        _, paypal_after = req("GET", "/debug/paypal")
+        show("blocked", {"allowed": blocked["allowed"], "reason": blocked["reason"],
+                         "escrow_id": blocked["escrow_id"],
+                         "paypal_calls_before": paypal_before,
+                         "paypal_calls_after": paypal_after})
+        assert not blocked["allowed"] and blocked["reason"] == "over_remaining_cap"
+        assert blocked["escrow_id"] is None
+        assert paypal_before == paypal_after, "PayPal client touched on blocked path!"
+        print("[proof] over-authority attempt BLOCKED; PayPal rail untouched (call counts identical)")
+
+        # ---- 2b. assertion-level spy: the gate itself must never call ------
+        from permit.flow import SpendPipeline
+        from permit.ledger import Ledger
+        from permit.permit import PermitStore
+        from settlement.paypal_client import PayPalClient
+        from settlement.verifier import PredicateType, ReleaseVerifier
+
+        class StrictSpy(PayPalClient):
+            def authorize(self, amount_cents, merchant_id):
+                raise AssertionError("GATE FAILURE: PayPal.authorize called on a blocked attempt")
+            def capture(self, auth_id, amount_cents, idempotency_key):
+                raise AssertionError("GATE FAILURE: PayPal.capture called on a blocked attempt")
+            def void(self, auth_id):
+                raise AssertionError("GATE FAILURE: PayPal.void called on a blocked attempt")
+
+        lg = Ledger()
+        ps = PermitStore(ledger=lg)
+        spy = StrictSpy()
+        vf = ReleaseVerifier(spy, ps, ledger=lg)
+        fl = SpendPipeline(ps, spy, vf, ledger=lg)
+        p2, _ = ps.grant("spy_agent", 1000, [merchant],
+                         datetime.now(timezone.utc) + timedelta(hours=1))
+        attempt = fl.spend(p2.permit_id, 9999, merchant, PredicateType.D, digest)
+        assert not attempt.allowed and attempt.reason == "over_remaining_cap"
+        assert attempt.escrow_id is None
+        print("[proof] assertion-spy survived: blocked spend never called PayPal (authorize would have raised)")
+
+        # ---- 3. release the allowed escrow, then e-stop a second permit ----
+        _, rel = req("POST", f"/api/escrows/{escrow_id}/release",
+                     {"delivered_bytes_b64": base64.b64encode(artifact).decode()})
+        show("release", rel)
+        assert rel["released"] and rel["capture_id"], "release should capture"
+
+        _, grant2 = req("POST", "/api/permits", {
+            "agent_id": "trace_agent", "cap_cents": 5000,
+            "allowlist": [merchant], "expiry_hours": 1})
+        pid2 = grant2["permit_id"]
+        _, spend2 = req("POST", f"/api/permits/{pid2}/spend", {
+            "amount_cents": 1000, "merchant_id": merchant,
+            "predicate": "delivery_hash", "artifact_hash": digest})
+        assert spend2["allowed"]
+        escrow2 = spend2["escrow_id"]
+
+        _, estop = req("POST", f"/api/permits/{pid2}/estop", {})
+        show("estop", estop)
+        assert estop["revoked"] and escrow2 in estop["voided_escrows"], "e-stop must void the in-flight escrow"
+
+        _, refused = req("POST", f"/api/escrows/{escrow2}/release",
+                         {"delivered_bytes_b64": base64.b64encode(artifact).decode()})
+        show("post-estop-release", refused)
+        assert not refused["released"], "release after e-stop must be refused"
+
+        # post-e-stop check must also fail (permit revoked)
+        _, check2 = req("POST", f"/api/permits/{pid2}/check",
+                        {"amount_cents": 100, "merchant_id": merchant})
+        assert not check2["allowed"] and check2["reason"] == "revoked"
+
+        # ---- ledger integrity ------------------------------------------------
+        _, led = req("GET", "/api/ledger")
+        show("ledger", {"chain": led["chain"], "receipt_count": len(led["receipts"])})
+        assert led["chain"]["ok"], f"ledger chain broken: {led['chain']['reason']}"
+
+        print("\nTRACE COMPLETE: allowed flows, blocked never touches PayPal, e-stop voids in-flight. All green.")
+    finally:
+        srv.terminate()
+        out, _ = srv.communicate(timeout=10)
+        if out:
+            print("--- server log ---")
+            print(out.strip())
+
+
+if __name__ == "__main__":
+    main()
