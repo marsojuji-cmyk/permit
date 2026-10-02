@@ -29,9 +29,30 @@ Four clauses. No discretion, no vibes.
 - **Interlock** ([marsojuji-cmyk/interlock](https://github.com/marsojuji-cmyk/interlock), open-source, MIT) for the claim ledger and the leased-authority model. Every permit issuance, payment attempt, and e-stop is a signed ledger claim.
 - An **AI agent** spender operating strictly inside its permit. It can reason, plan, and attempt purchases, but the authority check sits between intent and money.
 
+## Run it
+
+```bash
+python -m pytest -q        # full suite (mock rail, no credentials, no network)
+python demo.py             # end-to-end mock demo with the receipt chain
+python server.py           # the service: http://127.0.0.1:8741
+python trace.py            # drives the live server: allowed flow, blocked
+                           # attempt that never touches PayPal, e-stop void,
+                           # ledger chain verification
+```
+
+The service exposes the core verbs as JSON: issue a permit
+(`POST /api/permits`), check authority, spend, release an escrow,
+e-stop a permit, and read the ledger (`GET /api/ledger`). Mock mode is the
+default; `--sandbox` arms the real PayPal sandbox rail (needs
+`PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive
+payer approval per order).
+
 ## Status
 
-Building in the open, six weeks to the hackathon deadline. The ledger and authority model exist in Interlock today; the PayPal sandbox rail, the agent spender, and the live e-stop demo are being built here.
+Building in the open, six weeks to the hackathon deadline. The permit core,
+the 4-clause authority gate, the spend pipeline, the release-verifier, the
+PayPal sandbox REST client, and the e-stop path are implemented and tested
+here; the agent spender and the recorded video demo are next.
 
 ## License
 
