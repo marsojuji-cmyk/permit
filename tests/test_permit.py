@@ -169,7 +169,13 @@ def test_no_paypal_imports_in_permit_module():
                     assert "paypal" not in alias.name.lower(), (
                         f"PayPal import in {mod.__name__}: {alias.name}"
                     )
+                    assert "settlement" not in alias.name.lower(), (
+                        f"settlement import in {mod.__name__}: {alias.name}"
+                    )
             elif isinstance(node, ast.ImportFrom):
                 assert not (node.module and "paypal" in node.module.lower()), (
                     f"PayPal import in {mod.__name__}: {node.module}"
+                )
+                assert not (node.module and "settlement" in node.module.lower()), (
+                    f"settlement import in {mod.__name__}: {node.module}"
                 )
