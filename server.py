@@ -236,12 +236,13 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/permits/([\w-]+)/estop", self.path)
         if m:
             try:
-                receipt, voided = flow.estop(m.group(1))
+                result = flow.estop(m.group(1))
             except AssertionError:
                 return self._error(404, "unknown_permit")
             return self._send(200, {
-                "revoked": True, "voided_escrows": voided,
-                "receipt": receipt_summary(receipt),
+                "revoked": True, "voided_escrows": result.voided,
+                "unknown_open": list(result.unknown_open),
+                "receipt": receipt_summary(result.receipt),
             })
 
         m = re.fullmatch(r"/api/escrows/([\w-]+)/release", self.path)

@@ -83,6 +83,32 @@ class ApprovalRequired(Exception):
         self.artifact_hash = artifact_hash
 
 
+@dataclass(frozen=True)
+class EstopResult:
+    """
+    What estop() did to the money.
+
+    receipt: the E-STOP event. The permit is revoked either way.
+    voided: holds whose void PayPal confirmed. Those reservations are released.
+    unknown_open: escrows in UNKNOWN state (a capture may still be settling).
+        E-stop deliberately does NOT void these: racing a pending capture
+        could double-move money. They stay reserved and reconcile() is the
+        only way forward. Listed so the stop report never reads clean while
+        money is still possibly in flight.
+
+    Iterates as (receipt, voided) so `receipt, voided = flow.estop(...)`
+    keeps working at every existing call site.
+    """
+
+    receipt: Receipt
+    voided: list[str]
+    unknown_open: list[str]
+
+    def __iter__(self):
+        yield self.receipt
+        yield self.voided
+
+
 def _is_needs_payer_approval(exc: BaseException) -> bool:
     """
     Duck-typed NeedsPayerApproval check. The sandbox client raises an
@@ -205,7 +231,11 @@ class SpendPipeline:
             pp_auth = self._authorize(
                 amount_cents,
                 merchant_id,
-                idempotency_key=f"{permit_id}:{auth_id}:authorize",
+                # Attempt key, not a call key: the sandbox client derives
+                # distinct PayPal-Request-Id values for create vs authorize,
+                # because PayPal replays the prior response when one request
+                # id is reused across different API calls.
+                idempotency_key=f"{permit_id}:{auth_id}",
             )
         except Exception as exc:
             if _is_needs_payer_approval(exc):
@@ -395,23 +425,36 @@ class SpendPipeline:
         """Evidence in, money out - or a REFUSED receipt. Pass-through."""
         return self.verifier.verify_and_capture(escrow_id, evidence)
 
-    def estop(self, permit_id: str) -> tuple[Receipt, list[str]]:
+    def estop(self, permit_id: str) -> EstopResult:
         """
         E-stop: revoke the permit, void every in-flight escrow, AND void
         every outstanding authorized-but-unregistered hold (the threaded
         case of the P1-1 race — the in-authorize case is caught by the
         post-authorize recheck in spend()).
 
-        Returns the e-stop receipt and the voided ids: escrow ids for
-        registered escrows, permit auth_ids for outstanding unregistered
-        holds.
+        Returns an EstopResult: the e-stop receipt, the voided ids (escrow
+        ids for registered escrows, permit auth_ids for outstanding
+        unregistered holds), and unknown_open — escrows in UNKNOWN state,
+        which e-stop deliberately does not void (racing a pending capture
+        could double-move money). Those stay reserved; reconcile() is the
+        only way forward.
         """
         receipt, in_flight_auth_ids = self.permits.estop(permit_id)
         voided: list[str] = []
+        unknown_open: list[str] = []
         # Registered escrows first (existing behavior).
         for auth_id in in_flight_auth_ids:
             escrow_id = self._auth_to_escrow.get(auth_id)
-            if escrow_id is not None and self.verifier.void(escrow_id):
+            if escrow_id is None:
+                continue
+            escrow = self.verifier.get_escrow(escrow_id)
+            if escrow is not None and getattr(escrow, "state", None) == "UNKNOWN":
+                # A capture may still be settling on the provider. Do not
+                # race it with a void; leave the reservation held and point
+                # the operator at reconcile(). Listed, never silent.
+                unknown_open.append(escrow_id)
+                continue
+            if self.verifier.void(escrow_id):
                 voided.append(escrow_id)
         # Outstanding authorized-but-unregistered holds.
         with self._outstanding_lock:
@@ -430,4 +473,4 @@ class SpendPipeline:
             self.permits.settle_void(permit_id, auth_id)
             self._drop_outstanding(auth_id)
             voided.append(auth_id)
-        return receipt, voided
+        return EstopResult(receipt, voided, unknown_open)

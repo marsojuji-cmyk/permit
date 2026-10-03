@@ -121,6 +121,11 @@ class ReleaseVerifier:
         self._escrows: dict[str, Escrow] = {}
         self._lock = threading.Lock()
 
+    def get_escrow(self, escrow_id: str) -> Escrow | None:
+        """Read-only accessor for one escrow (e-stop classification)."""
+        with self._lock:
+            return self._escrows.get(escrow_id)
+
     def register(self, escrow: Escrow) -> Receipt:
         """Register an escrow hold. Returns the AUTHORIZED receipt."""
         with self._lock:

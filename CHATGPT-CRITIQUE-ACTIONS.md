@@ -88,3 +88,61 @@ failures + completed sandbox approval + one integrated sandbox purchase.
 - Report tests by failure category (policy / provider mocks / sandbox / concurrency /
   crash-recovery), not just a count. Existing protections to keep and name: cumulative
   reserved+captured accounting, per-permit lock, serialized release, capture idempotency key.
+
+---
+
+# Grok CLI adversarial review — action ledger (2026-10-03 ~01:00 UTC)
+
+Source: Grok CLI (subscription) reviewed permit/, settlement/, server.py and the
+demo scripts at remote main d51798b2, with the prior ChatGPT review marked as
+already-fixed. Seven new findings. Engine: ~/.grok/bin/grok --prompt-file
+($0 marginal cost). Full raw findings archived at
+~/workspace/goals/ship-permit-to-the-paypal-ai-hackathon/hidden_files/permit10/out/t2_findings.md.
+
+## Status
+- P0-1 request-id reuse across PayPal calls: FIXED — see below.
+- P1-4 e-stop drops UNKNOWN holds: FIXED — see below.
+- P1-6 narration describes a sandbox run that is actually the mock: FIXED —
+  video/narration-script.md rewritten to name the mock rail (file only, uncommitted;
+  no mock rail IDs presented as PayPal money).
+- P0-2 reconcile voids CREATED auth while capture PENDING: OPEN.
+- P1-3 HTTP/void failures never enter UNKNOWN or CLEANUP_PENDING: OPEN.
+- P1-5 authorize failure has no recovery handle: OPEN.
+- P2-7 sandbox reconcile writes the authorization id into paypal_capture_id: OPEN.
+
+## What landed (remote main, this section's push)
+- P0-1: SandboxPayPalClient.authorize() now derives distinct PayPal-Request-Id
+  values per call type from the attempt key (`<base>:create`,
+  `<base>:authorize`); flow.py passes the attempt key `<permit_id>:<auth_id>`
+  instead of reusing one key for create-order and authorize-order. Retrying
+  the same attempt reuses the same derived keys (desired idempotency).
+  Test: test_authorize_uses_distinct_request_ids_for_create_and_authorize.
+  Note: the "38-byte limit" half of the finding is unverified against PayPal
+  docs; the reuse half is the evidenced defect and is what was fixed.
+- P1-4: new EstopResult (receipt, voided, unknown_open); iterates as
+  (receipt, voided) so every existing `receipt, voided = flow.estop(...)`
+  call site keeps working. E-stop classifies UNKNOWN escrows into
+  unknown_open WITHOUT calling void (racing a pending capture could
+  double-move money); reservation stays held; reconcile() is the only way
+  forward. server.py and dashboard/server.py surface unknown_open in the
+  estop JSON. Test: test_estop_lists_unknown_hold_instead_of_racing_it.
+
+## Open findings (fix sketches in the raw findings file)
+- P0-2: reconcile() treats an authorization still CREATED as "nothing
+  captured" and voids it while the capture resource is PENDING. Fix:
+  reconcile from the capture (persist paypal_capture_id on UNKNOWN, GET the
+  capture), treat capture PENDING as still unknown, void only on
+  DECLINED/FAILED or no capture. Needs sandbox-client capture-status
+  surfacing. Settlement surgery: deferred to a dedicated session.
+- P1-3: capture HTTP 5xx / malformed 2xx / non-timeout void failures never
+  enter UNKNOWN or a real CLEANUP_PENDING; retry-cleanup and reconcile become
+  no-ops while the payee may hold funds. Fix: typed void results for
+  PREVIOUSLY_VOIDED / AUTHORIZATION_ALREADY_CAPTURED / AUTHORIZATION_EXPIRED /
+  AUTHORIZATION_VOIDED; treat capture 5xx like PayPalTimeout. Deferred.
+- P1-5: authorize exception (including resume after payer approval) keeps no
+  operation record: order id and auth id are lost, reservation stuck, e-stop
+  and reconcile have nothing to address. Fix: retain operation record,
+  POST /api/operations/<id>/retry, e-stop by order_id. Deferred.
+- P2-7: sandbox reconcile writes the authorization id into paypal_capture_id
+  (sandbox client has no captures map). Fix: return latest capture id/status
+  from get_authorization; omit the field when unavailable. Deferred.
