@@ -294,10 +294,20 @@ class SandboxPayPalClient(PayPalClient):
         payer hasn't approved yet; the caller then calls authorize_order()
         with the same order_id after approval - it must NOT call this
         method again (that would create a second order and double-reserve).
+
+        The idempotency_key is an ATTEMPT key, not a call key: PayPal
+        replays the previous response when a PayPal-Request-Id is reused
+        across different API calls, so create and authorize each get a
+        derived key (key + ":create", key + ":authorize"). Retrying the
+        same attempt reuses the same derived keys, which is the desired
+        idempotency. A retry of authorize_order() after approval uses the
+        ":authorize" key again.
         """
-        order_id, _ = self.create_order(amount_cents, idempotency_key)
+        create_key = f"{idempotency_key}:create" if idempotency_key is not None else None
+        auth_key = f"{idempotency_key}:authorize" if idempotency_key is not None else None
+        order_id, _ = self.create_order(amount_cents, create_key)
         return self.authorize_order(order_id, amount_cents, merchant_id,
-                                    idempotency_key)
+                                    auth_key)
 
     def get_authorization(self, auth_id: str) -> Authorization:
         """

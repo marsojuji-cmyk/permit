@@ -80,8 +80,10 @@ class Dashboard:
     def estop(self, permit_id: str) -> dict:
         if not self.flow:
             return {"ok": False, "error": "no flow bound"}
-        receipt, voided = self.flow.estop(permit_id)
-        return {"ok": True, "receipt_seq": receipt.seq, "voided": voided}
+        result = self.flow.estop(permit_id)
+        return {"ok": True, "receipt_seq": result.receipt.seq,
+                "voided": result.voided,
+                "unknown_open": list(result.unknown_open)}
 
     # -- http ---------------------------------------------------------------
 

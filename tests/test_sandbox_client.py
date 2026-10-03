@@ -170,3 +170,30 @@ def test_void_tolerates_empty_204_body():
     void = c.void("AUTH999")
     assert void.auth_id == "AUTH999"
     assert void.status == "VOIDED"
+
+
+def test_authorize_uses_distinct_request_ids_for_create_and_authorize():
+    """
+    P0 regression (2026-10-02 adversarial review): create-order and
+    authorize-order must NOT share one PayPal-Request-Id. PayPal replays
+    the earlier call's response on reuse, which made authorize raise
+    KeyError and stranded the reservation with no UNKNOWN receipt.
+    """
+    client = SandboxPayPalClient("id", "secret")
+    client._token = "tok"
+    seen = []
+
+    def fake_http(method, path, body=None, auth=None, request_id=None, **kwargs):
+        seen.append((method, path, request_id))
+        if path == "/v2/checkout/orders":
+            return (201, ORDER)
+        return (201, AUTH_BODY)
+
+    client._http = fake_http
+    auth = client.authorize(3000, "merchant_x", idempotency_key="prm_x:auth_y")
+    assert auth.auth_id == "AUTH999"
+    create_ids = [r for (m, p, r) in seen if p == "/v2/checkout/orders"]
+    authz_ids = [r for (m, p, r) in seen if p.endswith("/authorize")]
+    assert create_ids == ["prm_x:auth_y:create"], create_ids
+    assert authz_ids == ["prm_x:auth_y:authorize"], authz_ids
+    assert create_ids[0] != authz_ids[0]
