@@ -61,6 +61,12 @@ class UnknownPermit(Exception):
     """Raised when an operation names a permit id the store does not hold."""
 
 
+# Delegation depth bound (converged from the level-up line): a delegation
+# tree cannot grow without limit. Depth 0 is a granted root; each carve
+# adds one. Delegation past this depth is BLOCKED, not raised.
+MAX_DELEGATION_DEPTH = 8
+
+
 def _validate_amount(amount_cents) -> int:
     """
     Amount guard at the authority boundary: amount_cents must be an int
@@ -122,6 +128,9 @@ class Permit:
     in_flight: dict[str, int] = field(default_factory=dict)
     # Delegation: set when this permit was carved out of a parent permit.
     parent_id: str | None = None
+    # Delegation depth: 0 for a granted root, parent.depth + 1 for a carve.
+    # Bounded by MAX_DELEGATION_DEPTH at delegation time.
+    depth: int = 0
     # Tighten overlays (v4 min-gate): post-issuance narrowings. Each is
     # None until the first tighten touches that clause; tighten() only
     # ever narrows, so the effective clause is the minimum/intersection
@@ -219,6 +228,7 @@ class PermitStore:
 
         Constraints — each violation writes a BLOCKED receipt:
           - parent exists, unrevoked, unexpired
+          - delegation depth stays within MAX_DELEGATION_DEPTH
           - cap_cents <= parent remaining (can't delegate what isn't free)
           - allowlist ⊆ parent allowlist (no merchant escalation)
           - expiry <= parent expiry (can't outlive the parent)
@@ -264,6 +274,8 @@ class PermitStore:
                     reason = "parent_revoked"
                 elif now >= eff_expiry:
                     reason = "parent_expired"
+                elif parent.depth + 1 > MAX_DELEGATION_DEPTH:
+                    reason = "delegation_too_deep"
                 elif cap_cents > eff_remaining:
                     reason = "over_parent_remaining"
                 elif not set(child_allowlist) <= set(eff_allow):
@@ -293,6 +305,7 @@ class PermitStore:
                     allowlist=child_allowlist,
                     expiry=expiry,
                     parent_id=parent.permit_id,
+                    depth=parent.depth + 1,
                 )
                 self._permits[child.permit_id] = child
                 self._children.setdefault(parent.permit_id, []).append(
@@ -308,6 +321,7 @@ class PermitStore:
                         "allowlist": list(child_allowlist),
                         "expiry": expiry.isoformat(),
                         "parent_remaining_cents": parent.remaining_cents(),
+                        "depth": child.depth,
                     },
                 )
                 return DelegateResult(True, "delegated", child, receipt)
@@ -471,6 +485,50 @@ class PermitStore:
                 if approval.status == "pending":
                     out.append(approval)
             return out
+
+    def lineage(self, permit_id: str) -> list[Permit]:
+        """
+        Ancestor chain for a permit, nearest parent first. Snapshot of
+        references only — liveness is evaluated separately under each
+        ancestor's own lock. Permits are never deleted, so a missing
+        ancestor is treated as a fail-closed block, not a skip.
+        """
+        chain: list[Permit] = []
+        seen = {permit_id}
+        with self._store_lock:
+            cur = self._permits.get(permit_id)
+            while cur is not None and cur.parent_id is not None:
+                if cur.parent_id in seen:
+                    break  # defensive: depth is strictly increasing, no cycles
+                seen.add(cur.parent_id)
+                parent = self._permits.get(cur.parent_id)
+                if parent is None:
+                    chain.append(None)  # type: ignore[arg-type]
+                    break
+                chain.append(parent)
+                cur = parent
+        return chain
+
+    @staticmethod
+    def _lineage_block_reason(
+        chain: list[Permit], now: datetime
+    ) -> str | None:
+        """
+        Fail-closed ancestor liveness: every ancestor must be unrevoked
+        and unexpired, or the spend is blocked. Nearest ancestor first.
+        Caller holds the spending permit's lock; ancestor locks are taken
+        child -> ancestor, which cannot cycle (delegation depth strictly
+        increases, and no path ever locks ancestor -> child).
+        """
+        for ancestor in chain:
+            if ancestor is None:
+                return "ancestor_missing"
+            with ancestor._lock:
+                if ancestor.revoked:
+                    return "ancestor_revoked"
+                if now >= ancestor.expiry:
+                    return "ancestor_expired"
+        return None
 
     def tighten(
         self,
@@ -707,8 +765,13 @@ class PermitStore:
         if permit is None:
             return CheckResult(False, "unknown_permit")
 
+        chain = self.lineage(permit_id)
         with permit._lock:
             reason = self._evaluate(permit, amount_cents, merchant_id, now)
+            if reason is None:
+                # Delegation lineage: a spend under a sub-permit is only
+                # allowed while every ancestor is live. Fail closed.
+                reason = self._lineage_block_reason(chain, now)
         if reason is not None:
             return CheckResult(False, reason)
         return CheckResult(True, "allowed")
@@ -758,6 +821,7 @@ class PermitStore:
         # This is the shared logic the server's /check route also uses.
         probe = self.eligible(permit_id, amount_cents, merchant_id, now=now)
 
+        chain = self.lineage(permit_id)
         with permit._lock:
             # Authoritative re-evaluation under the per-permit lock: the
             # probe is read-only, so the lock serializes reservation
@@ -765,6 +829,12 @@ class PermitStore:
             # lock's view wins over the probe's (reservations may have
             # been released between the two).
             reason = self._evaluate(permit, amount_cents, merchant_id, now)
+            if reason is None:
+                # Delegation lineage gate, re-applied authoritatively:
+                # ancestor liveness under each ancestor's own lock,
+                # child -> ancestor order (cannot cycle: delegation depth
+                # strictly increases).
+                reason = self._lineage_block_reason(chain, now)
             if reason is not None:
                 receipt = self.ledger.append(
                     "BLOCKED",

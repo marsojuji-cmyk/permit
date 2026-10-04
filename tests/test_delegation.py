@@ -257,3 +257,109 @@ def test_sibling_subpermits_cannot_overspend_parent():
     r3 = permits.delegate(parent.permit_id, "a3", 1, ["m"], EXP)
     assert not r3.ok and r3.reason == "over_parent_remaining"
     assert not permits.eligible(parent.permit_id, 1, "m").allowed
+# -- convergence: depth bound + fail-closed lineage (from the level-up line)
+# ---------------------------------------------------------------------------
+# The carve-out semantic is main's (grant-time encumbrance closes the
+# over-issuance leak); the depth bound and lineage gate are ported from
+# the level-up branch's attenuation line. Both now hold at once.
+
+
+def test_delegate_sets_depth_and_receipts_it():
+    from permit.permit import MAX_DELEGATION_DEPTH
+
+    permits, parent, EXP = _store()
+    assert parent.depth == 0
+    r1 = permits.delegate(parent.permit_id, "a1", 1000, ["m"], EXP)
+    assert r1.ok and r1.permit.depth == 1
+    assert r1.receipt.payload["depth"] == 1
+    r2 = permits.delegate(r1.permit.permit_id, "a2", 500, ["m"], EXP)
+    assert r2.ok and r2.permit.depth == 2
+    assert MAX_DELEGATION_DEPTH == 8
+
+
+def test_delegate_too_deep_blocked_with_receipt():
+    from permit.permit import MAX_DELEGATION_DEPTH
+
+    permits, parent, EXP = _store(cap_cents=100000)
+    cur = parent
+    for i in range(MAX_DELEGATION_DEPTH):
+        exp = EXP - timedelta(minutes=i + 1)
+        res = permits.delegate(cur.permit_id, f"a{i}", 100, ["m"], exp)
+        assert res.ok, res.reason
+        cur = res.permit
+    assert cur.depth == MAX_DELEGATION_DEPTH
+    exp = EXP - timedelta(minutes=MAX_DELEGATION_DEPTH + 1)
+    res = permits.delegate(cur.permit_id, "too-deep", 100, ["m"], exp)
+    assert not res.ok
+    assert res.reason == "delegation_too_deep"
+    assert res.permit is None
+    # No carve was reserved on the would-be parent.
+    assert cur.reserved_cents == 0
+    blocked = [
+        r for r in permits.ledger.receipts()
+        if r.event_type == "BLOCKED"
+        and r.payload.get("reason") == "delegation_too_deep"
+    ]
+    assert len(blocked) == 1
+
+
+def test_lineage_returns_nearest_first_chain():
+    permits, parent, EXP = _store()
+    r1 = permits.delegate(parent.permit_id, "a1", 1000, ["m"], EXP)
+    r2 = permits.delegate(r1.permit.permit_id, "a2", 500, ["m"], EXP)
+    chain = permits.lineage(r2.permit.permit_id)
+    assert [p.permit_id for p in chain] == [
+        r1.permit.permit_id,
+        parent.permit_id,
+    ]
+    assert permits.lineage(parent.permit_id) == []
+
+
+def test_lineage_gate_blocks_spend_when_ancestor_revoked():
+    # Defense in depth: an ancestor revoked through any path that does
+    # not cascade still fails the descendant's spend closed.
+    permits, parent, EXP = _store()
+    r1 = permits.delegate(parent.permit_id, "a1", 2000, ["m"], EXP)
+    child = r1.permit
+    with parent._lock:
+        parent.revoked = True
+    result = permits.check(child.permit_id, 100, "m")
+    assert not result.allowed
+    assert result.reason == "ancestor_revoked"
+    assert result.receipt.payload["reason"] == "ancestor_revoked"
+
+
+def test_eligible_applies_lineage_gate_without_receipt():
+    permits, parent, EXP = _store()
+    r1 = permits.delegate(parent.permit_id, "a1", 2000, ["m"], EXP)
+    with parent._lock:
+        parent.revoked = True
+    result = permits.eligible(r1.permit.permit_id, 100, "m")
+    assert not result.allowed
+    assert result.reason == "ancestor_revoked"
+    assert result.receipt is None
+
+
+def test_lineage_block_reason_unit_cases():
+    from permit.permit import PermitStore
+
+    permits, parent, EXP = _store()
+    r1 = permits.delegate(parent.permit_id, "a1", 2000, ["m"], EXP)
+    now = datetime.now(timezone.utc)
+    # Healthy chain: no block.
+    assert (
+        PermitStore._lineage_block_reason(permits.lineage(r1.permit.permit_id), now)
+        is None
+    )
+    # Missing ancestor fails closed.
+    assert (
+        PermitStore._lineage_block_reason([None], now) == "ancestor_missing"
+    )
+    # Expired ancestor fails closed (direct unit check; in practice a
+    # child cannot outlive its parent's granted expiry).
+    with parent._lock:
+        parent.expiry = now - timedelta(seconds=1)
+    assert (
+        PermitStore._lineage_block_reason(permits.lineage(r1.permit.permit_id), now)
+        == "ancestor_expired"
+    )
