@@ -88,6 +88,42 @@ class SpendTools:
             "captured_cents": permit.captured_cents,
             "remaining_cents": permit.remaining_cents(),
             "revoked": permit.revoked,
+            "parent_id": permit.parent_id,
+        })
+
+    def delegate_subpermit(
+        self, cap_cents: int, agent_id: str, expiry_minutes: int = 60
+    ) -> str:
+        """
+        Carve a sub-permit out of this permit's remaining cap for another
+        agent. The child inherits this permit's merchant allowlist, cannot
+        outlive it, and cannot exceed its remaining cap. The carved amount
+        is reserved here until the child spends or is revoked.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        permit = self.flow.permits.get(self.permit_id)
+        if permit is None:
+            return json.dumps({"ok": False, "error": "permit not found"})
+        result = self.flow.delegate(
+            parent_permit_id=self.permit_id,
+            agent_id=agent_id,
+            cap_cents=cap_cents,
+            allowlist=list(permit.allowlist),
+            expiry=datetime.now(timezone.utc)
+            + timedelta(minutes=expiry_minutes),
+        )
+        if not result.ok:
+            return json.dumps({"ok": False, "error": result.reason})
+        child = result.permit
+        return json.dumps({
+            "ok": True,
+            "child_permit_id": child.permit_id,
+            "agent_id": child.agent_id,
+            "cap_cents": child.cap_cents,
+            "parent_remaining_cents": self.flow.permits.get(
+                self.permit_id
+            ).remaining_cents(),
         })
 
     # -- harness-only (NOT exposed to the LLM) ------------------------------
