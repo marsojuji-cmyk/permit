@@ -52,7 +52,7 @@ from __future__ import annotations
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .ledger import Ledger, Receipt
 
@@ -93,6 +93,22 @@ class DelegateResult:
 
 
 @dataclass
+class PendingApproval:
+    """A principal-approval request for an above-threshold spend."""
+    approval_id: str
+    permit_id: str
+    agent_id: str
+    amount_cents: int
+    merchant_id: str
+    predicate_type: str  # PredicateType value, e.g. "D"
+    artifact_hash: str
+    # pending | approved | denied | expired | consumed
+    status: str = "pending"
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass
 class Permit:
     permit_id: str
     agent_id: str
@@ -113,10 +129,23 @@ class Permit:
     tighten_cap_cents: int | None = None
     tighten_allowlist: tuple[str, ...] | None = None
     tighten_expiry: datetime | None = None
+    # Principal-approval threshold: spends above this need a human word.
+    # None = no threshold. Tighten-only via tighten().
+    approval_threshold_cents: int | None = None
+    tighten_approval_threshold_cents: int | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
-        return self.cap_cents - self.reserved_cents - self.captured_cents
+        # Through the tighten-only min-gate: the principal sees the
+        # remaining budget the authority actually enforces, not the
+        # granted cap a tighten has since narrowed.
+        cap = self.cap_cents
+        if (
+            self.tighten_cap_cents is not None
+            and self.tighten_cap_cents < cap
+        ):
+            cap = self.tighten_cap_cents
+        return cap - self.reserved_cents - self.captured_cents
 
 
 class PermitStore:
@@ -129,6 +158,8 @@ class PermitStore:
         self._permits: dict[str, Permit] = {}
         # Delegation index: parent permit_id -> child permit_ids.
         self._children: dict[str, list[str]] = {}
+        # Principal approvals: approval_id -> PendingApproval.
+        self._approvals: dict[str, PendingApproval] = {}
         self._store_lock = threading.Lock()
 
     def grant(
@@ -137,14 +168,18 @@ class PermitStore:
         cap_cents: int,
         allowlist: list[str],
         expiry: datetime,
+        approval_threshold_cents: int | None = None,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
+        if approval_threshold_cents is not None:
+            _validate_amount(approval_threshold_cents)
         permit = Permit(
             permit_id=f"prm_{uuid.uuid4().hex[:12]}",
             agent_id=agent_id,
             cap_cents=cap_cents,
             allowlist=tuple(allowlist),
             expiry=expiry,
+            approval_threshold_cents=approval_threshold_cents,
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -156,6 +191,7 @@ class PermitStore:
                 "cap_cents": cap_cents,
                 "allowlist": list(allowlist),
                 "expiry": expiry.isoformat(),
+                "approval_threshold_cents": approval_threshold_cents,
             },
         )
         return permit, receipt
@@ -276,6 +312,166 @@ class PermitStore:
                 )
                 return DelegateResult(True, "delegated", child, receipt)
 
+    # -- principal approvals ------------------------------------------------
+
+    @staticmethod
+    def _effective_threshold(permit: Permit) -> int | None:
+        """
+        The approval threshold through the tighten-only min-gate: the
+        narrowest (smallest) of the granted threshold and the tighten
+        overlay. None = no threshold. Caller must hold permit._lock.
+        """
+        t = permit.approval_threshold_cents
+        o = permit.tighten_approval_threshold_cents
+        if t is None:
+            return o
+        if o is None:
+            return t
+        return min(t, o)
+
+    def approval_threshold(self, permit_id: str) -> int | None:
+        """Effective principal-approval threshold, or None if unset."""
+        permit = self.get(permit_id)
+        if permit is None:
+            return None
+        with permit._lock:
+            return self._effective_threshold(permit)
+
+    def request_approval(
+        self,
+        permit_id: str,
+        amount_cents: int,
+        merchant_id: str,
+        predicate_type: str,
+        artifact_hash: str,
+        ttl_minutes: int = 15,
+        now: datetime | None = None,
+    ) -> PendingApproval:
+        """
+        Request principal approval for an above-threshold spend. The
+        4-clause authority check must already pass (via eligible()); no
+        cap is reserved — the reservation happens only when an approved
+        request is completed. Raises ValueError on misuse.
+        """
+        now = now or datetime.now(timezone.utc)
+        _validate_amount(amount_cents)
+        permit = self.get(permit_id)
+        if permit is None:
+            raise ValueError("unknown_permit")
+        with permit._lock:
+            if self._evaluate(permit, amount_cents, merchant_id, now) is not None:
+                raise ValueError("authority_check_failed")
+            threshold = self._effective_threshold(permit)
+            if threshold is None or amount_cents <= threshold:
+                raise ValueError("approval_not_required")
+            approval = PendingApproval(
+                approval_id=f"apr_{uuid.uuid4().hex[:12]}",
+                permit_id=permit.permit_id,
+                agent_id=permit.agent_id,
+                amount_cents=amount_cents,
+                merchant_id=merchant_id,
+                predicate_type=predicate_type,
+                artifact_hash=artifact_hash,
+                created_at=now.isoformat(),
+                expires_at=(now + timedelta(minutes=ttl_minutes)).isoformat(),
+            )
+            with self._store_lock:
+                self._approvals[approval.approval_id] = approval
+            receipt = self.ledger.append(
+                "APPROVAL_REQUESTED",
+                {
+                    "approval_id": approval.approval_id,
+                    "permit_id": permit.permit_id,
+                    "agent_id": permit.agent_id,
+                    "amount_cents": amount_cents,
+                    "merchant_id": merchant_id,
+                    "threshold_cents": threshold,
+                    "expires_at": approval.expires_at,
+                },
+            )
+            return approval
+
+    def get_approval(self, approval_id: str) -> PendingApproval | None:
+        with self._store_lock:
+            return self._approvals.get(approval_id)
+
+    def _expire_if_due(self, approval: PendingApproval,
+                       now: datetime) -> bool:
+        """Lazily expire a pending approval. Returns True if expired."""
+        if approval.status == "pending" and now >= datetime.fromisoformat(
+            approval.expires_at
+        ):
+            approval.status = "expired"
+            self.ledger.append(
+                "APPROVAL_DECIDED",
+                {
+                    "approval_id": approval.approval_id,
+                    "permit_id": approval.permit_id,
+                    "decision": "expired",
+                    "actor": "system",
+                },
+            )
+            return True
+        return False
+
+    def decide_approval(
+        self,
+        approval_id: str,
+        approved: bool,
+        actor: str = "human",
+        now: datetime | None = None,
+    ) -> PendingApproval:
+        """
+        The principal's word: approve or deny a pending request. Raises
+        ValueError when the request is unknown, already decided, or
+        expired. Approval does NOT reserve or move money — it only
+        authorizes a later complete_approved_spend(), which re-runs the
+        full authority check (fail-closed if the budget moved).
+        """
+        now = now or datetime.now(timezone.utc)
+        with self._store_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is None:
+                raise ValueError("unknown_approval")
+            if self._expire_if_due(approval, now):
+                raise ValueError("approval_expired")
+            if approval.status != "pending":
+                raise ValueError(f"approval_already_{approval.status}")
+            approval.status = "approved" if approved else "denied"
+            self.ledger.append(
+                "APPROVAL_DECIDED",
+                {
+                    "approval_id": approval.approval_id,
+                    "permit_id": approval.permit_id,
+                    "agent_id": approval.agent_id,
+                    "amount_cents": approval.amount_cents,
+                    "merchant_id": approval.merchant_id,
+                    "decision": approval.status,
+                    "actor": actor,
+                },
+            )
+            return approval
+
+    def consume_approval(self, approval_id: str) -> None:
+        """Mark an approved request consumed after its spend reserves."""
+        with self._store_lock:
+            approval = self._approvals.get(approval_id)
+            if approval is not None and approval.status == "approved":
+                approval.status = "consumed"
+
+    def pending_approvals(
+        self, now: datetime | None = None
+    ) -> list[PendingApproval]:
+        """Live approval requests for the principal's dashboard."""
+        now = now or datetime.now(timezone.utc)
+        with self._store_lock:
+            out = []
+            for approval in self._approvals.values():
+                self._expire_if_due(approval, now)
+                if approval.status == "pending":
+                    out.append(approval)
+            return out
+
     def tighten(
         self,
         permit_id: str,
@@ -283,6 +479,7 @@ class PermitStore:
         cap_cents: int | None = None,
         remove_merchants: list[str] | None = None,
         expiry: datetime | None = None,
+        approval_threshold_cents: int | None = None,
         actor: str = "human",
     ) -> tuple[Permit, Receipt]:
         """
@@ -298,6 +495,10 @@ class PermitStore:
           the permit, use e-stop).
         - expiry: timezone-aware datetime, strictly sooner than the current
           effective expiry and still in the future.
+        - approval_threshold_cents: new principal-approval threshold, a
+          positive int strictly below the current effective threshold
+          (or any positive int when no threshold is set — setting one is
+          itself a narrowing).
         - actor: who ordered the tighten (recorded on the receipt).
 
         Cannot tighten a revoked permit or one whose effective window has
@@ -308,10 +509,15 @@ class PermitStore:
         a descendant already narrower than the new bound is untouched.
         """
         now = datetime.now(timezone.utc)
-        if cap_cents is None and not remove_merchants and expiry is None:
+        if (
+            cap_cents is None
+            and not remove_merchants
+            and expiry is None
+            and approval_threshold_cents is None
+        ):
             raise ValueError(
                 "tighten requires at least one of cap_cents, "
-                "remove_merchants, expiry"
+                "remove_merchants, expiry, approval_threshold_cents"
             )
         if not isinstance(actor, str) or not actor.strip():
             raise ValueError("actor must be a non-empty string")
@@ -320,6 +526,8 @@ class PermitStore:
         # Validate the requested narrowing once, up front.
         if cap_cents is not None:
             _validate_amount(cap_cents)
+        if approval_threshold_cents is not None:
+            _validate_amount(approval_threshold_cents)
         if remove_merchants is not None and (
             not isinstance(remove_merchants, list)
             or not remove_merchants
@@ -359,6 +567,15 @@ class PermitStore:
                 changes: dict[str, dict] = {}
                 if cap_cents is not None and cap_cents < eff_cap:
                     changes["cap_cents"] = {"from": eff_cap, "to": cap_cents}
+                if approval_threshold_cents is not None:
+                    eff_threshold = self._effective_threshold(target)
+                    if eff_threshold is None or (
+                        approval_threshold_cents < eff_threshold
+                    ):
+                        changes["approval_threshold_cents"] = {
+                            "from": eff_threshold,
+                            "to": approval_threshold_cents,
+                        }
                 if rm:
                     if rm <= set(eff_allow):
                         new_allow = set(eff_allow) - rm
@@ -389,6 +606,10 @@ class PermitStore:
                         target.tighten_allowlist = tuple(sorted(base - rm))
                     if "expiry" in changes:
                         target.tighten_expiry = expiry
+                    if "approval_threshold_cents" in changes:
+                        target.tighten_approval_threshold_cents = (
+                            approval_threshold_cents
+                        )
                     payload: dict = {
                         "permit_id": target.permit_id,
                         "agent_id": target.agent_id,

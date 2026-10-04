@@ -35,6 +35,14 @@ Captures roll up: when the child captures, each ancestor moves reserved→captur
 python3 demo_delegation.py --fast   # two LLM agents, five beats, live dashboard
 ```
 
+## Principal approvals: a human word on big spends
+
+A permit can carry an **approval threshold**. Spends at or below it flow through the normal authority check; spends above it don't reserve, don't touch PayPal, and come back `PENDING` with an approval id. The principal approves or denies from the dashboard — and approval is a word, not a lock: `complete_approved_spend()` re-runs the full authority check against the *stored* (permit, amount, merchant), so a budget that moved since approval fails closed. Denied approvals can never complete; completed approvals are single-use. Pending requests expire (15 minutes default). Thresholds are tighten-only: they can be set and lowered on a live permit, never raised.
+
+```bash
+python3 demo_approval.py --fast   # LLM agent, five beats: auto-allow, approve, deny, fail-closed
+```
+
 ## The spend pipeline
 
 ```
