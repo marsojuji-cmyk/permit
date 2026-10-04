@@ -152,3 +152,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome — I review ever
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+---
+
+Built by Marcus Richards.
