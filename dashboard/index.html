@@ -62,6 +62,8 @@
   .ev.AUTHORIZED{color:var(--blue);} .ev.CAPTURED{color:var(--green);}
   .ev.BLOCKED{color:var(--amber);} .ev.REFUSED{color:var(--red);}
   .ev.VOIDED{color:var(--amber);} .ev.REVOKED{color:var(--red);}
+  .ev.DELEGATED{color:var(--blue);} .ev.REVOKED_CASCADE{color:var(--red);}
+  .ev.CARVE_RELEASED{color:var(--green);} .ev.E-STOP{color:var(--red);}
   .detail { color:var(--dim); }
   .empty { color:var(--dim); font-style:italic; padding:12px 0; }
   #err { color:var(--red); font-size:12px; margin-bottom:12px; display:none; }
@@ -97,6 +99,10 @@ function receiptDetail(r){
     case "REFUSED": return esc(p.reason||"");
     case "VOIDED": return `escrow ${esc((p.escrow_id||"").slice(0,12))}…`;
     case "REVOKED": return `permit ${esc((p.permit_id||"").slice(0,12))}…`;
+    case "E-STOP": return `permit ${esc((p.permit_id||"").slice(0,12))}… revoked`;
+    case "DELEGATED": return `cap ${cents(p.cap_cents)} · child of ${esc((p.parent_id||"").slice(0,12))}… · ${esc(p.agent_id||"")}`;
+    case "REVOKED_CASCADE": return `cascade from ${esc((p.parent_id||"").slice(0,12))}… · revoked ${esc((p.permit_id||"").slice(0,12))}…`;
+    case "CARVE_RELEASED": return `${cents(p.released_cents||0)} back to parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
     default: return "";
   }
 }
@@ -124,6 +130,7 @@ async function refresh(){
       const pct = p.cap_cents ? Math.max(0,100*p.remaining_cents/p.cap_cents) : 0;
       return `<div class="permit card ${p.revoked?"revoked":""}">
         <div class="mono" style="color:var(--dim)">${esc(p.permit_id)}</div>
+        ${p.parent_id?`<div class="mono" style="color:var(--dim);font-size:11px">sub-permit of ${esc(p.parent_id.slice(0,14))}…</div>`:""}
         <div class="money">${cents(p.remaining_cents)} <small>remaining of ${cents(p.cap_cents)}</small></div>
         <div class="bar"><i style="width:${pct}%"></i></div>
         <div class="kv"><span>reserved</span><b>${cents(p.reserved_cents)}</b></div>

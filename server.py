@@ -15,6 +15,14 @@ Permit service: a minimal HTTP server exposing the core verbs.
     reconcile unknown POST /api/escrows/<escrow_id>/reconcile   {}
     retry cleanup     POST /api/escrows/<escrow_id>/retry-cleanup {}
     e-stop            POST /api/permits/<permit_id>/estop   {}
+                      revokes the permit and every descendant (cascade);
+                      voids in-flight holds across the subtree
+    delegate permit   POST /api/permits/<permit_id>/delegate  {agent_id, cap_cents, allowlist, expiry_hours}
+                      carves a sub-permit from the parent's remaining cap
+    revoke cascade    POST /api/permits/<permit_id>/revoke-cascade  {}
+                      revokes the permit and every descendant, voids
+                      in-flight holds across the subtree, releases
+                      unspent carves post-order
     ledger            GET  /api/ledger
     debug (mock only) GET  /debug/paypal -> mock call counts
 
@@ -120,6 +128,7 @@ class Handler(BaseHTTPRequestHandler):
                 "captured_cents": p.captured_cents,
                 "remaining_cents": p.remaining_cents(),
                 "in_flight": len(p.in_flight),
+                "parent_id": p.parent_id,
             })
         if self.path == "/api/ledger":
             ok, reason = ledger.verify_chain()
@@ -156,6 +165,29 @@ class Handler(BaseHTTPRequestHandler):
                 expiry=datetime.now(timezone.utc) + timedelta(hours=hours),
             )
             return self._send(201, {"permit_id": permit.permit_id, "receipt": receipt_summary(receipt)})
+
+        m = re.fullmatch(r"/api/permits/([\w-]+)/delegate", self.path)
+        if m:
+            try:
+                agent_id = body["agent_id"]
+                cap_cents = int(body["cap_cents"])
+                allowlist = list(body["allowlist"])
+                hours = float(body.get("expiry_hours", 1))
+            except (KeyError, TypeError, ValueError):
+                return self._error(400, "need agent_id, cap_cents, allowlist, expiry_hours")
+            res = permits.delegate(
+                m.group(1), agent_id, cap_cents, allowlist,
+                expiry=datetime.now(timezone.utc) + timedelta(hours=hours),
+            )
+            if not res.ok:
+                if res.reason == "unknown_parent":
+                    return self._error(404, "unknown_parent")
+                return self._error(400, res.reason)
+            return self._send(201, {
+                "permit_id": res.permit.permit_id,
+                "parent_id": res.permit.parent_id,
+                "receipt": receipt_summary(res.receipt),
+            })
 
         m = re.fullmatch(r"/api/permits/([\w-]+)/check", self.path)
         if m:
@@ -241,6 +273,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(404, "unknown_permit")
             return self._send(200, {
                 "revoked": True, "voided_escrows": voided,
+                "receipt": receipt_summary(receipt),
+            })
+
+        m = re.fullmatch(r"/api/permits/([\w-]+)/revoke-cascade", self.path)
+        if m:
+            pid = m.group(1)
+            if permits.get(pid) is None:
+                return self._error(404, "unknown_permit")
+            # descendants before the revoke, so the response can name them
+            cascaded = []
+            queue = list(permits.children_of(pid))
+            while queue:
+                cid = queue.pop(0)
+                cascaded.append(cid)
+                queue.extend(permits.children_of(cid))
+            receipt, voided = flow.revoke_cascade(pid)
+            return self._send(200, {
+                "revoked": True, "cascaded_to": cascaded,
+                "voided_escrows": voided,
                 "receipt": receipt_summary(receipt),
             })
 

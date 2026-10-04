@@ -240,3 +240,20 @@ def test_single_child_revoke_reclaims_carve():
     assert not parent.revoked
     assert parent.remaining_cents() == 5000
     assert permits.children_of(parent.permit_id) == []
+
+
+def test_sibling_subpermits_cannot_overspend_parent():
+    # Two children carved from one $50 parent can together authorize at most
+    # $50: the carve partitions the parent's remaining cap at delegation.
+    permits, parent, EXP = _store()
+    r1 = permits.delegate(parent.permit_id, "a1", 2500, ["m"], EXP)
+    r2 = permits.delegate(parent.permit_id, "a2", 2500, ["m"], EXP)
+    assert r1.ok and r2.ok
+    c1, c2 = r1.permit, r2.permit
+    assert permits.get(parent.permit_id).remaining_cents() == 0
+    assert permits.eligible(c1.permit_id, 2500, "m").allowed
+    assert permits.eligible(c2.permit_id, 2500, "m").allowed
+    # a third carve, or any spend beyond the carves, is impossible
+    r3 = permits.delegate(parent.permit_id, "a3", 1, ["m"], EXP)
+    assert not r3.ok and r3.reason == "over_parent_remaining"
+    assert not permits.eligible(parent.permit_id, 1, "m").allowed

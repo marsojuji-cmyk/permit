@@ -73,13 +73,13 @@ python demo.py             # end-to-end mock demo with the receipt chain
 python demo_six_beat.py    # six-beat mock demo incl. timeout → UNKNOWN → reconcile
 python server.py           # the service: http://127.0.0.1:8741
 python trace.py            # drives the live server: allowed flow, blocked
-                           # attempt that never touches PayPal, e-stop void,
-                           # ledger chain verification
+                           # attempt that never touches PayPal, delegate +
+                           # cascade revoke, ledger chain verification
 ```
 
-The six beats (all in `demo_six_beat.py`, mock mode): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → e-stop voids a mid-hold authorization → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture.
+The six beats (all in `demo_six_beat.py`, mock mode): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → delegate a $15 sub-permit, child holds $10, revoke the parent cascades (child revoked, hold voided, carve released) → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture.
 
-The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`), check authority (read-only: no reservation, no receipt), spend, resume an approval (`POST /api/operations/<id>/resume`), release an escrow, reconcile, retry cleanup, e-stop a permit, and read the ledger (`GET /api/ledger`). Mock mode is the default; `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive payer approval per order; set `PERMIT_PAYPAL_MERCHANT_ID` to enable merchant binding).
+The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`), delegate a sub-permit (`POST /api/permits/<id>/delegate`), check authority (read-only: no reservation, no receipt), spend, resume an approval (`POST /api/operations/<id>/resume`), release an escrow, reconcile, retry cleanup, e-stop a permit, revoke a permit and its whole subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default; `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive payer approval per order; set `PERMIT_PAYPAL_MERCHANT_ID` to enable merchant binding).
 
 ## Which evidence is which
 
