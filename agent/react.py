@@ -6,9 +6,10 @@ OBSERVATION lines, and finishes with ANSWER. The runner executes only
 the tools in SpendTools; anything else the model emits is ignored.
 
 Transcript: every turn is appended to a JSONL transcript (llm text,
-parsed action, observation) so the video can show the agent's real
-reasoning trace. --replay <transcript> re-runs a saved transcript
-without calling the LLM (offline fallback for recording day).
+parsed action, observation) so the video can show the agent's reasoning
+trace. --replay <transcript> reads saved records and returns saved answer
+text without calling the LLM; it does not dispatch tools or reconstruct
+payment, escrow, ledger, or dashboard state, and is not a full offline demo.
 """
 
 from __future__ import annotations
@@ -111,8 +112,9 @@ def run_agent(tools, task: str, transcript_path: str,
     """
     Drive the agent on `task`. Returns the final ANSWER.
     Every turn is appended to transcript_path as JSONL, sectioned by beat.
-    With replay=<path>, replays that transcript's turns for this beat
-    without calling the LLM (offline fallback for recording day).
+    With replay=<path>, reads that transcript's saved turns for this beat
+    without calling the LLM. Replay logs records and returns saved answer
+    text; it does not dispatch tools or rebuild pipeline state.
     """
     transcript = open(transcript_path, "a")
     history = f"TASK: {task}\n"
@@ -121,7 +123,7 @@ def run_agent(tools, task: str, transcript_path: str,
     system = build_system(list(tools.catalog.keys()))
 
     if replay:
-        # Offline fallback: replay this beat's section of a saved transcript.
+        # Read this beat's saved transcript section; no tools are dispatched.
         final, in_beat = "", False
         for line in open(replay):
             obj = json.loads(line)

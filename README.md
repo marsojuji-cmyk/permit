@@ -53,27 +53,57 @@ Each PayPal order needs interactive payer approval:
 - **PayPal sandbox** as the payment rail. Permit-authorized captures execute as genuine sandbox transactions; blocked attempts never reach PayPal at all.
 - **Claim ledger**: an in-memory SHA-256 hash chain (append-only; chain verification before every capture). It is **not** signed and it is **not** durable — those are stated boundaries, not features.
 - **Interlock** ([marsojuji-cmyk/interlock](https://github.com/marsojuji-cmyk/interlock), open-source, MIT) is the conceptual origin of the leased-authority model. The ledger dependency was removed; this repo's ledger is standalone.
-- An **AI agent** spender operating strictly inside its permit. It can reason, plan, and attempt purchases, but the authority check sits between intent and money. The runner CLI path is configurable via `PERMIT_GROK_CLI` (the demo default points at the author's workspace Grok runner); `--replay` re-runs a saved transcript with no LLM at all.
+- An **AI agent** spender operating strictly inside its permit. It can reason, plan, and attempt purchases, but the authority check sits between intent and money. The runner CLI path is configurable via `PERMIT_GROK_CLI` (the demo default points at the author's workspace Grok runner). The optional advanced agent path invokes that external runner unless `--replay` is supplied, so it has service, credential, and possible cost/network prerequisites. `--replay` reads saved transcript records and returns their saved answer text; it does not dispatch tools or reconstruct payment, escrow, ledger, or dashboard state.
 
 ## Run it
 
+Python >=3.11 is recommended. Clone the repository, create a virtual
+environment with a supported interpreter, and activate it:
+
 ```bash
-python -m pytest -q        # full suite (mock rail, no credentials, no network)
-python demo.py             # end-to-end mock demo with the receipt chain
-python demo_six_beat.py    # six-beat mock demo incl. timeout → UNKNOWN → reconcile
+git clone https://github.com/marsojuji-cmyk/permit.git
+cd permit
+python3.11 -m venv .venv
+source .venv/bin/activate
+```
+
+Then run the dependency-free deterministic mock pipeline:
+
+```bash
+python demo.py             # end-to-end mock pipeline with the receipt chain
+```
+
+The basic demo uses the mock payment rail; it makes no PayPal or model calls
+and contains no agent decision. Observed basic output includes `allowed
+release`, an `over_remaining_cap` block, `already_voided` after e-stop, and a
+verified mock ledger; IDs vary between runs.
+
+Tests are optional. Install pytest and run the test suite separately:
+
+```bash
+python -m pip install pytest
+python -m pytest -q
+```
+
+The six-beat path is advanced and optional. Its default agent uses the
+external configurable Grok runner, so it is not deterministic, offline, or
+credential-free. Use it only when that service is configured:
+
+```bash
+python demo_six_beat.py    # mock payment rail, external agent runner
 python server.py           # the service: http://127.0.0.1:8741
 python trace.py            # drives the live server: allowed flow, blocked
                            # attempt that never touches PayPal, e-stop void,
                            # ledger chain verification
 ```
 
-The six beats (all in `demo_six_beat.py`, mock mode): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → e-stop voids a mid-hold authorization → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture.
+The six beats (mock payment rail, with the external agent runner by default): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → e-stop voids a mid-hold authorization → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture. This is not a recorded integrated PayPal run.
 
 The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`), check authority (read-only: no reservation, no receipt), spend, resume an approval (`POST /api/operations/<id>/resume`), release an escrow, reconcile, retry cleanup, e-stop a permit, and read the ledger (`GET /api/ledger`). Mock mode is the default; `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive payer approval per order; set `PERMIT_PAYPAL_MERCHANT_ID` to enable merchant binding).
 
 ## Which evidence is which
 
-- `demo_six_beat.py` — **mock rail**: deterministic, no network, no credentials. The recorded camera run.
+- `demo_six_beat.py` — **mock rail with an optional external agent runner**: the payment client is mock, but the default agent path requires its configured service. `--replay` only reads/logs saved transcript text; it does not complete the six-beat pipeline offline, and no public replay fixture is claimed.
 - `spike.py` / `spike-report.md` — **separately recorded sandbox evidence** (Oct 2 spike): real REST calls, order/authorize/capture/void against PayPal sandbox, merchant identity verified.
 - `docs/sandbox-runbook.md` — the **scripted procedure** for an integrated six-beat sandbox run (needs credentials + interactive approval). The integrated sandbox run is a procedure to execute, not a recorded artifact yet.
 
