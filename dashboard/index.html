@@ -78,6 +78,7 @@
 <div class="grid">
   <div>
     <div class="card"><h2>Permits</h2><div id="permits"></div></div>
+    <div class="card"><h2>Pending approvals</h2><div id="approvals"></div></div>
     <div class="card"><h2>In-flight escrows</h2><div id="escrows"></div></div>
   </div>
   <div class="card"><h2>Receipt chain</h2><div id="chain"></div></div>
@@ -103,8 +104,18 @@ function receiptDetail(r){
     case "DELEGATED": return `cap ${cents(p.cap_cents)} · child of ${esc((p.parent_id||"").slice(0,12))}… · ${esc(p.agent_id||"")}`;
     case "REVOKED_CASCADE": return `cascade from ${esc((p.parent_id||"").slice(0,12))}… · revoked ${esc((p.permit_id||"").slice(0,12))}…`;
     case "CARVE_RELEASED": return `${cents(p.released_cents||0)} back to parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
+    case "APPROVAL_REQUESTED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")} · needs principal`;
+    case "APPROVAL_DECIDED": return `${esc(p.decision||"")} · ${esc(p.actor||"")}`;
+    case "APPROVAL_PENDING": return `${cents(p.amount_cents)} · waiting on principal`;
     default: return "";
   }
+}
+
+async function decideApproval(id, approve){
+  const res = await fetch(`/api/approvals/${id}/${approve?"approve":"deny"}`,{method:"POST"});
+  const j = await res.json();
+  if(!j.ok) alert("decision failed: "+(j.error||"unknown"));
+  refresh();
 }
 
 async function estop(pid){
@@ -147,6 +158,15 @@ async function refresh(){
         ${cents(e.amount_cents)}</span>
         <span class="st ${e.state}">${e.state}</span></div>`
     ).join("") : `<div class="empty">no escrows in flight</div>`;
+
+    $("approvals").innerHTML = (s.approvals||[]).length ? s.approvals.map(a=>
+      `<div class="escrow"><span>${cents(a.amount_cents)} · ${esc(a.merchant_id)}<br>
+        <span class="mono" style="color:var(--dim)">${esc(a.agent_id)} · expires ${esc(a.expires_at.slice(11,16))} UTC</span></span>
+        <span><button class="st" style="color:var(--green);border-color:var(--green);background:none;cursor:pointer;margin-right:6px"
+          onclick="decideApproval('${esc(a.approval_id)}',true)">APPROVE</button><button class="st"
+          style="color:var(--red);border-color:var(--red);background:none;cursor:pointer"
+          onclick="decideApproval('${esc(a.approval_id)}',false)">DENY</button></span></div>`
+    ).join("") : `<div class="empty">no pending approvals</div>`;
 
     $("chain").innerHTML = s.receipts.length ? [...s.receipts].reverse().map(r=>
       `<div class="rcpt"><span class="seq">#${String(r.seq).padStart(2,"0")}</span>
