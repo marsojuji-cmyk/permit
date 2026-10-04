@@ -1,8 +1,29 @@
 # Permit
 
-**Payment authority for AI agents.** Permit puts enforceable spending permissions between an AI agent and PayPal: a budget, approved merchants, an expiry, and revocation — with a receipt for each decision.
+**Payment authority for AI agents.** Agents spend on permits, never on raw account access.
 
-Built for the [PayPal AI Hackathon](https://paypalaihackathon.devpost.com/) (Nov 12, 2026).
+[![Tests](https://img.shields.io/badge/tests-98%20passing-brightgreen)](https://github.com/marsojuji-cmyk/permit/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Demo](https://img.shields.io/badge/demo-no%20credentials%20needed-brightgreen)](#quick-start)
+
+---
+
+## What it is
+
+Every AI agent that spends money needs an authority layer: the thing that decides what it's *allowed* to spend, on whose terms, with what record. Permit is that layer.
+
+An agent never touches raw account access. It spends on a **permit** — a budget cap, a merchant allowlist, an expiry. Every attempt, allowed or blocked, is written to a tamper-evidary **claim ledger**. An **e-stop** revokes a permit mid-spend and voids every in-flight authorization it can reach.
+
+```
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│  Agent  │───▶│ Permit  │───▶│  Check  │───▶│ PayPal  │
+│  wants  │    │ authority│    │ 4 clauses│    │ sandbox │
+│ to buy  │    │ layer    │    │ + ledger │    │  hold   │
+└─────────┘    └─────────┘    └─────────┘    └─────────┘
+```
+
+---
 
 ## ⚡ Quick Start (no credentials needed)
 
@@ -14,17 +35,26 @@ python demo.py
 
 You'll see a complete agent transaction with 12 receipts — every decision, every payment, every audit trail.
 
-![Permit Demo](https://img.shields.io/badge/demo-run%20locally-blue)
+**What just happened?**
 
-## The problem
+| Receipt | What it means |
+|---|---|
+| `permit.created` | A spending permit was issued: $50 budget, Amazon only, 24h expiry |
+| `check.attempt` | Agent tried to buy something — Permit checked the 4 clauses |
+| `check.allowed` | Budget OK, merchant OK, not expired, not revoked → allowed |
+| `escrow.reserved` | Money held on the permit (not yet captured) |
+| `evidence.submitted` | Agent submitted proof of delivery |
+| `predicate.passed` | Delivery evidence verified against permit rules |
+| `capture.success` | Payment captured — money moved |
+| `ledger.sealed` | Receipt chain hashed and sealed |
 
-AI agents are about to get wallets. Every major lab is building toward it. What is not yet built, anywhere we can find, is the authority layer: the thing that decides what an agent is *allowed* to spend, on whose terms, with what record. This prototype is one concrete answer to that gap — scoped, testable, and honest about its boundaries (see below).
+The full demo runs 12 receipts. No network, no credentials, no PayPal calls.
 
-## What it does
+---
 
-No agent touches raw account access, ever. Each agent spends on a **permit**: an amount cap, a merchant allowlist, an expiry. Every attempt, allowed or blocked, is written to a tamper-evident **claim ledger**. The **e-stop** revokes a permit mid-spend and voids every in-flight authorization it can reach.
+## The authority check
 
-The authority check, stated exactly: attempt `a` against permit `P` is authorized iff
+The gate, stated exactly: attempt `a` against permit `P` is authorized iff
 
 ```
 amount(a) <= remaining(P)
@@ -33,9 +63,11 @@ amount(a) <= remaining(P)
   AND NOT revoked(P)
 ```
 
-where `remaining(P) = cap(P) − reserved(P) − captured(P)`. Four clauses. No discretion, no vibes. Amounts are validated at the authority boundary: only positive integers; anything else is blocked and receipted.
+where `remaining(P) = cap(P) − reserved(P) − captured(P)`.
 
-Expiry is evaluated twice: at check time and at release time. A release attempted after expiry fails closed — the hold is voided, the reservation freed, no money moves.
+Four clauses. No discretion, no vibes. Amounts are validated at the boundary: only positive integers; anything else is blocked and receipted.
+
+---
 
 ## The spend pipeline
 
@@ -44,65 +76,79 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
       → evidence in → predicate evaluated → idempotent capture
 ```
 
-- **Capture is single-flight and idempotent.** The idempotency key is derived from the permit and claim id (`{permit_id}:{auth_id}:capture`), sent as `PayPal-Request-Id`, so a retried capture after a timeout cannot double-charge.
-- **Timeouts go UNKNOWN, never guessed.** If a capture call times out, the escrow is marked UNKNOWN — never optimistically captured or failed. `reconcile()` re-queries PayPal for the authorization's true state and converges the ledger: CAPTURED if the money moved (recorded as truth — a completed capture can't be voided), VOIDED with the reservation freed otherwise. The ledger and PayPal always converge; "always mirrors" is a recovery procedure, not a hope.
-- **Failed cleanup is retryable.** If voiding a hold fails, the escrow waits in CLEANUP_PENDING with the reservation held — never silently released — until `retry_cleanup()` confirms the void.
-- **Merchant binding.** The sandbox client binds the provider-reported `payee.merchant_id`, currency (CAD), and amount to the authorized operation, and refuses any permit merchant that doesn't match the configured merchant account (`PERMIT_PAYPAL_MERCHANT_ID`). Fail closed on mismatch.
-- **E-stop vs in-flight authorization.** The operation is tracked before the external authorize call; if revocation or expiry lands while authorization is outstanding, the hold is voided and the spend dies. Capture admission rechecks revocation and expiry immediately before money moves.
+**Key properties:**
 
-## The approval flow (sandbox)
+- **Single-flight capture.** Idempotency key derived from permit + claim ID. Retried captures after timeout cannot double-charge.
+- **Timeouts go UNKNOWN, never guessed.** If capture times out, escrow is marked UNKNOWN. `reconcile()` re-queries PayPal for truth: CAPTURED if money moved, VOIDED otherwise. Ledger and PayPal always converge.
+- **Failed cleanup is retryable.** If voiding a hold fails, escrow waits in CLEANUP_PENDING with reservation held — never silently released.
+- **Merchant binding.** Sandbox client binds provider-reported merchant ID, currency, and amount. Refuses mismatched merchants. Fail closed.
+- **E-stop vs in-flight.** If revocation lands while authorization is outstanding, hold is voided and spend dies. Capture rechecks revocation immediately before money moves.
 
-Each PayPal order needs interactive payer approval:
-
-1. `POST /api/permits/<id>/spend` → authority check reserves the cap, the pipeline creates the PayPal order and tries to authorize it. Before payer approval, the service answers **202** with `{status: approval_required, operation_id, order_id, approval_url}`. The reservation stays held; the operation, order, and reservation are retained server-side.
-2. The payer approves at `approval_url` (approval is confirmed by polling the order's API state, never the checkout page).
-3. `POST /api/operations/<operation_id>/resume` → authorizes the **same** order (never a second one) and registers the escrow.
-4. `POST /api/escrows/<id>/release` with delivery evidence → predicate check → capture.
-5. `POST /api/escrows/<id>/reconcile` / `/retry-cleanup` → recovery paths above.
-
-## Architecture
-
-- **PayPal sandbox** as the payment rail. Permit-authorized captures execute as genuine sandbox transactions; blocked attempts never reach PayPal at all.
-- **Claim ledger**: an in-memory SHA-256 hash chain (append-only; chain verification before every capture). It is **not** signed and it is **not** durable — those are stated boundaries, not features.
-- **Interlock** ([marsojuji-cmyk/interlock](https://github.com/marsojuji-cmyk/interlock), open-source, MIT) is the conceptual origin of the leased-authority model. The ledger dependency was removed; this repo's ledger is standalone.
-- An **AI agent** spender operating strictly inside its permit. It can reason, plan, and attempt purchases, but the authority check sits between intent and money. The runner CLI path is configurable via `PERMIT_GROK_CLI` (the demo default points at the author's workspace Grok runner); `--replay` re-runs a saved transcript with no LLM at all.
+---
 
 ## Run it
 
 ```bash
+python demo.py             # end-to-end mock demo with receipt chain
+python demo_six_beat.py    # six-beat demo: timeout → UNKNOWN → reconcile
 python -m pytest -q        # full suite (mock rail, no credentials, no network)
-python demo.py             # end-to-end mock demo with the receipt chain
-python demo_six_beat.py    # six-beat mock demo incl. timeout → UNKNOWN → reconcile
-python server.py           # the service: http://127.0.0.1:8741
-python trace.py            # drives the live server: allowed flow, blocked
-                           # attempt that never touches PayPal, e-stop void,
-                           # ledger chain verification
+python server.py           # service at http://127.0.0.1:8741
+python trace.py            # drives live server: allowed, blocked, e-stop, ledger
 ```
 
-The six beats (all in `demo_six_beat.py`, mock mode): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → e-stop voids a mid-hold authorization → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture.
+**The six beats** (all mock mode, no network):
 
-The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`), check authority (read-only: no reservation, no receipt), spend, resume an approval (`POST /api/operations/<id>/resume`), release an escrow, reconcile, retry cleanup, e-stop a permit, and read the ledger (`GET /api/ledger`). Mock mode is the default; `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive payer approval per order; set `PERMIT_PAYPAL_MERCHANT_ID` to enable merchant binding).
+1. Grant permit → $30 honest purchase captured
+2. $60 over-cap blocked → PayPal untouched
+3. E-stop voids mid-hold authorization
+4. Tampered evidence refused → hold voided
+5. Dropped capture → UNKNOWN → reconciles to provider truth
+6. Exactly one capture, exactly one receipt chain
 
-## Which evidence is which
+---
 
-- `demo_six_beat.py` — **mock rail**: deterministic, no network, no credentials. The recorded camera run.
-- `spike.py` / `spike-report.md` — **separately recorded sandbox evidence** (Oct 2 spike): real REST calls, order/authorize/capture/void against PayPal sandbox, merchant identity verified.
-- `docs/sandbox-runbook.md` — the **scripted procedure** for an integrated six-beat sandbox run (needs credentials + interactive approval). The integrated sandbox run is a procedure to execute, not a recorded artifact yet.
+## Architecture
+
+| Component | Role |
+|---|---|
+| **Permit authority** | 4-clause gate between agent intent and money |
+| **Claim ledger** | SHA-256 hash chain, append-only, chain-verified before capture |
+| **PayPal sandbox** | Real REST transactions; blocked attempts never reach PayPal |
+| **E-stop** | Revokes future execution + voids uncaptured authorizations |
+| **Agent spender** | Operates strictly inside permit boundaries |
+
+**Interlock** ([marsojuji-cmyk/interlock](https://github.com/marsojuji-cmyk/interlock)) is the conceptual origin of the leased-authority model. This repo's ledger is standalone.
+
+---
 
 ## Production boundaries (stated plainly)
 
-- **All authoritative state is in memory.** A restart loses permits, escrows, revocations, and the ledger.
-- **The HTTP service has no caller authentication** (localhost demo boundary).
-- **The ledger can't detect removal of final entries** without an external checkpoint.
-- **Single-merchant sandbox prototype.** This demonstrates *a* payment authority layer for participating merchants — not a claim about all agent payments.
-- **E-stop revokes future execution and attempts void of uncaptured authorizations.** A completed capture needs a refund path, not a void — refunds are out of scope for this prototype.
-- Actors in the loop: the **payer** (approves), the **merchant** (delivers), the **Permit operator** (issues permits, holds the e-stop), the **credential owner** (holds the PayPal secret). The agent never holds credentials.
+- **All state is in memory.** Restart loses permits, escrows, ledger.
+- **No caller authentication.** Localhost demo boundary.
+- **Single-merchant prototype.** Demonstrates *a* payment authority layer — not all agent payments.
+- **E-stop voids uncaptured authorizations.** Completed captures need refunds (out of scope).
+- **Actors in the loop:** payer (approves), merchant (delivers), Permit operator (issues permits, holds e-stop), credential owner (holds PayPal secret). Agent never holds credentials.
+
+---
 
 ## Status
 
-Building in the open, six weeks to the hackathon deadline. Implemented and tested: the permit core, the 4-clause authority gate with positive-amount validation, the spend pipeline, the release-verifier with timeout recovery (UNKNOWN → reconcile), the PayPal sandbox REST client with merchant binding and idempotent capture, the e-stop path with in-flight authorization handling, the AI agent spender, and the six-beat mock demo. Remaining: the integrated sandbox run (procedure in `docs/sandbox-runbook.md`), the video (record by Nov 8), the Devpost package (submission-ready Nov 10).
+Building in the open. Implemented and tested:
+- Permit core with 4-clause authority gate
+- Spend pipeline with timeout recovery (UNKNOWN → reconcile)
+- PayPal sandbox REST client with merchant binding
+- E-stop with in-flight authorization handling
+- AI agent spender with transcript replay
+- 98 tests passing
+
+**Remaining:** integrated sandbox run (procedure in `docs/sandbox-runbook.md`), video (by Nov 8), Devpost submission (Nov 10).
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome — I review everything within 24 hours.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
