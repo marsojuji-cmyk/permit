@@ -4,6 +4,18 @@
 
 Built for the [PayPal AI Hackathon](https://paypalaihackathon.devpost.com/) (Nov 12, 2026).
 
+## ⚡ Quick Start (no credentials needed)
+
+```bash
+git clone https://github.com/marsojuji-cmyk/permit
+cd permit
+python demo.py
+```
+
+You'll see a complete agent transaction with 12 receipts — every decision, every payment, every audit trail.
+
+![Permit Demo](https://img.shields.io/badge/demo-run%20locally-blue)
+
 ## The problem
 
 AI agents are about to get wallets. Every major lab is building toward it. What is not yet built, anywhere we can find, is the authority layer: the thing that decides what an agent is *allowed* to spend, on whose terms, with what record. This prototype is one concrete answer to that gap — scoped, testable, and honest about its boundaries (see below).
@@ -93,3 +105,4 @@ Building in the open, six weeks to the hackathon deadline. Implemented and teste
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
