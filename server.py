@@ -48,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from permit.flow import ApprovalRequired, SpendPipeline
 from permit.ledger import Ledger
-from permit.permit import PermitStore
+from permit.permit import PermitStore, UnknownPermit
 from settlement.paypal_client import MockPayPalClient
 from settlement.verifier import (
     Evidence,
@@ -292,6 +292,44 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "revoked": True, "cascaded_to": cascaded,
                 "voided_escrows": voided,
+                "receipt": receipt_summary(receipt),
+            })
+
+        m = re.fullmatch(r"/api/permits/([\w-]+)/tighten", self.path)
+        if m:
+            permit_id = m.group(1)
+            kwargs: dict = {}
+            if "cap_cents" in body:
+                raw = body["cap_cents"]
+                if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+                    return self._error(400, "cap_cents must be a positive integer")
+                kwargs["cap_cents"] = raw
+            if "approval_threshold_cents" in body:
+                raw = body["approval_threshold_cents"]
+                if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+                    return self._error(400, "approval_threshold_cents must be a positive integer")
+                kwargs["approval_threshold_cents"] = raw
+            if "remove_merchants" in body:
+                rm = body["remove_merchants"]
+                if not isinstance(rm, list) or not rm:
+                    return self._error(400, "remove_merchants must be a non-empty list")
+                kwargs["remove_merchants"] = rm
+            if "expiry" in body:
+                try:
+                    kwargs["expiry"] = datetime.fromisoformat(body["expiry"])
+                except (TypeError, ValueError):
+                    return self._error(400, "expiry must be an ISO-8601 datetime")
+            if "actor" in body:
+                kwargs["actor"] = body["actor"]
+            try:
+                permit, receipt = permits.tighten(permit_id, **kwargs)
+            except UnknownPermit:
+                return self._error(404, "unknown_permit")
+            except ValueError as e:
+                return self._error(400, str(e))
+            return self._send(200, {
+                "tightened": True, "permit_id": permit.permit_id,
+                "changes": receipt.payload.get("changes", {}),
                 "receipt": receipt_summary(receipt),
             })
 
