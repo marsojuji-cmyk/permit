@@ -10,6 +10,10 @@ Spend pipeline: the only path from a spend attempt to money movement.
     release(): release-verifier's verify_and_capture - the sole capture path.
     estop():   revoke the permit, void every in-flight escrow AND every
                outstanding authorized-but-unregistered hold.
+    delegate(): carve a sub-permit out of a permit's remaining cap.
+    revoke_cascade():
+               revoke a permit and all descendants, void every in-flight
+               hold in the subtree, release unspent delegation carves.
 
 Invariant: no PayPal authorize or capture is reachable without an ALLOWED
 receipt on the same permit for the same attempt. The pipeline is the only
@@ -395,25 +399,37 @@ class SpendPipeline:
         """Evidence in, money out - or a REFUSED receipt. Pass-through."""
         return self.verifier.verify_and_capture(escrow_id, evidence)
 
-    def estop(self, permit_id: str) -> tuple[Receipt, list[str]]:
+    def delegate(
+        self,
+        parent_permit_id: str,
+        agent_id: str,
+        cap_cents: int,
+        allowlist: list[str],
+        expiry: datetime,
+    ):
         """
-        E-stop: revoke the permit, void every in-flight escrow, AND void
-        every outstanding authorized-but-unregistered hold (the threaded
-        case of the P1-1 race — the in-authorize case is caught by the
-        post-authorize recheck in spend()).
+        Carve a sub-permit out of a parent permit's remaining cap.
+        Thin pass-through to the permit store; constraints are enforced
+        there (unknown/revoked/expired parent, over-cap, merchant
+        escalation, expiry beyond parent).
+        """
+        return self.permits.delegate(
+            parent_permit_id, agent_id, cap_cents, allowlist, expiry
+        )
 
-        Returns the e-stop receipt and the voided ids: escrow ids for
-        registered escrows, permit auth_ids for outstanding unregistered
-        holds.
+    def _void_permit_holds(
+        self, permit_id: str, in_flight_auth_ids: list[str]
+    ) -> list[str]:
         """
-        receipt, in_flight_auth_ids = self.permits.estop(permit_id)
+        Void one permit's in-flight holds: registered escrows via the
+        verifier, plus outstanding authorized-but-unregistered holds
+        (the P1-1 race window). Shared by estop() and revoke_cascade().
+        """
         voided: list[str] = []
-        # Registered escrows first (existing behavior).
         for auth_id in in_flight_auth_ids:
             escrow_id = self._auth_to_escrow.get(auth_id)
             if escrow_id is not None and self.verifier.void(escrow_id):
                 voided.append(escrow_id)
-        # Outstanding authorized-but-unregistered holds.
         with self._outstanding_lock:
             pending = [
                 (auth_id, entry)
@@ -430,4 +446,49 @@ class SpendPipeline:
             self.permits.settle_void(permit_id, auth_id)
             self._drop_outstanding(auth_id)
             voided.append(auth_id)
+        return voided
+
+    def revoke_cascade(self, permit_id: str) -> tuple[Receipt, list[str]]:
+        """
+        Revoke a permit and every descendant permit, void every in-flight
+        hold in the subtree, then release unspent delegation carves
+        post-order (children before parents).
+
+        Returns the root receipt and the voided ids, mirroring estop().
+        """
+        receipt, in_flight = self.permits.revoke_subtree(permit_id)
+        voided: list[str] = []
+        for pid, auth_ids in in_flight.items():
+            voided.extend(self._void_permit_holds(pid, auth_ids))
+        # Release carves post-order: children before parents. The subtree
+        # map is keyed by permit; a child's parent always appears earlier
+        # in a BFS order, so reversed() yields children first. Permits
+        # without a parent (the root) are skipped by release_carve().
+        for pid in reversed(list(in_flight.keys())):
+            self.permits.release_carve(pid)
+        # Also release carves for revoked children that had no in-flight
+        # holds (they are not in the in_flight map).
+        for pid in reversed(self.permits.children_of(permit_id)):
+            self._release_subtree_carves(pid)
+        return receipt, voided
+
+    def _release_subtree_carves(self, permit_id: str) -> None:
+        """release_carve() for a permit and all its descendants, post-order."""
+        for cid in self.permits.children_of(permit_id):
+            self._release_subtree_carves(cid)
+        self.permits.release_carve(permit_id)
+
+    def estop(self, permit_id: str) -> tuple[Receipt, list[str]]:
+        """
+        E-stop: revoke the permit, void every in-flight escrow, AND void
+        every outstanding authorized-but-unregistered hold (the threaded
+        case of the P1-1 race — the in-authorize case is caught by the
+        post-authorize recheck in spend()).
+
+        Returns the e-stop receipt and the voided ids: escrow ids for
+        registered escrows, permit auth_ids for outstanding unregistered
+        holds.
+        """
+        receipt, in_flight_auth_ids = self.permits.estop(permit_id)
+        voided = self._void_permit_holds(permit_id, in_flight_auth_ids)
         return receipt, voided

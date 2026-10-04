@@ -72,6 +72,14 @@ class CheckResult:
 
 
 @dataclass
+class DelegateResult:
+    ok: bool
+    reason: str
+    permit: Permit | None = None
+    receipt: Receipt | None = None
+
+
+@dataclass
 class Permit:
     permit_id: str
     agent_id: str
@@ -83,6 +91,8 @@ class Permit:
     captured_cents: int = 0
     # Authorization ids currently holding a reservation on this permit.
     in_flight: dict[str, int] = field(default_factory=dict)
+    # Delegation: set when this permit was carved out of a parent permit.
+    parent_id: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -97,6 +107,8 @@ class PermitStore:
         # so `ledger or Ledger()` would silently discard a passed empty ledger.
         self.ledger = ledger if ledger is not None else Ledger()
         self._permits: dict[str, Permit] = {}
+        # Delegation index: parent permit_id -> child permit_ids.
+        self._children: dict[str, list[str]] = {}
         self._store_lock = threading.Lock()
 
     def grant(
@@ -131,6 +143,113 @@ class PermitStore:
     def get(self, permit_id: str) -> Permit | None:
         with self._store_lock:
             return self._permits.get(permit_id)
+
+    def children_of(self, permit_id: str) -> list[str]:
+        """Child permit ids delegated from this permit (a copy)."""
+        with self._store_lock:
+            return list(self._children.get(permit_id, []))
+
+    def delegate(
+        self,
+        parent_permit_id: str,
+        agent_id: str,
+        cap_cents: int,
+        allowlist: list[str],
+        expiry: datetime,
+        now: datetime | None = None,
+    ) -> DelegateResult:
+        """
+        Carve a sub-permit out of a parent permit's remaining cap.
+
+        Constraints — each violation writes a BLOCKED receipt:
+          - parent exists, unrevoked, unexpired
+          - cap_cents <= parent remaining (can't delegate what isn't free)
+          - allowlist ⊆ parent allowlist (no merchant escalation)
+          - expiry <= parent expiry (can't outlive the parent)
+
+        The carved cap is RESERVED on the parent, so the parent can never
+        double-spend delegated budget. A child capture rolls up: each
+        ancestor moves reserved→captured by the captured amount.
+        """
+        now = now or datetime.now(timezone.utc)
+        try:
+            _validate_amount(cap_cents)
+        except ValueError:
+            receipt = self.ledger.append(
+                "BLOCKED",
+                {
+                    "permit_id": parent_permit_id,
+                    "agent_id": agent_id,
+                    "amount_cents": repr(cap_cents),
+                    "reason": "invalid_amount",
+                },
+            )
+            return DelegateResult(False, "invalid_amount", None, receipt)
+
+        parent = self.get(parent_permit_id)
+        if parent is None:
+            receipt = self.ledger.append(
+                "BLOCKED",
+                {"permit_id": parent_permit_id, "reason": "unknown_parent"},
+            )
+            return DelegateResult(False, "unknown_parent", None, receipt)
+
+        child_allowlist = tuple(allowlist)
+        # Lock order: store -> parent. No path nests permit -> store,
+        # so this ordering cannot deadlock.
+        with self._store_lock:
+            with parent._lock:
+                if parent.revoked:
+                    reason = "parent_revoked"
+                elif now >= parent.expiry:
+                    reason = "parent_expired"
+                elif cap_cents > parent.remaining_cents():
+                    reason = "over_parent_remaining"
+                elif not set(child_allowlist) <= set(parent.allowlist):
+                    reason = "allowlist_escalation"
+                elif expiry > parent.expiry:
+                    reason = "expiry_beyond_parent"
+                else:
+                    reason = None
+                if reason is not None:
+                    receipt = self.ledger.append(
+                        "BLOCKED",
+                        {
+                            "permit_id": parent.permit_id,
+                            "agent_id": agent_id,
+                            "amount_cents": cap_cents,
+                            "reason": reason,
+                            "parent_remaining_cents": parent.remaining_cents(),
+                        },
+                    )
+                    return DelegateResult(False, reason, None, receipt)
+                # Carve: the child's cap is reserved on the parent.
+                parent.reserved_cents += cap_cents
+                child = Permit(
+                    permit_id=f"prm_{uuid.uuid4().hex[:12]}",
+                    agent_id=agent_id,
+                    cap_cents=cap_cents,
+                    allowlist=child_allowlist,
+                    expiry=expiry,
+                    parent_id=parent.permit_id,
+                )
+                self._permits[child.permit_id] = child
+                self._children.setdefault(parent.permit_id, []).append(
+                    child.permit_id
+                )
+                receipt = self.ledger.append(
+                    "DELEGATED",
+                    {
+                        "parent_permit_id": parent.permit_id,
+                        "child_permit_id": child.permit_id,
+                        "agent_id": agent_id,
+                        "cap_cents": cap_cents,
+                        "allowlist": list(child_allowlist),
+                        "expiry": expiry.isoformat(),
+                        "parent_remaining_cents": parent.remaining_cents(),
+                    },
+                )
+                return DelegateResult(True, "delegated", child, receipt)
 
     @staticmethod
     def _evaluate(permit: Permit, amount_cents: int, merchant_id: str, now: datetime) -> str | None:
@@ -260,6 +379,23 @@ class PermitStore:
             )
             return CheckResult(True, "allowed", receipt)
 
+    def _rollup_capture(self, permit: Permit, amount_cents: int) -> None:
+        """
+        Walk the delegation chain: each ancestor moves reserved→captured
+        by the captured amount. The delegation carve already encumbers the
+        parent, so only captures (real money out) move the parent's books —
+        child reserves and voids stay within the carve.
+        """
+        pid = permit.parent_id
+        while pid is not None:
+            parent = self.get(pid)
+            if parent is None:
+                break
+            with parent._lock:
+                parent.reserved_cents -= amount_cents
+                parent.captured_cents += amount_cents
+                pid = parent.parent_id
+
     def settle_capture(self, permit_id: str, auth_id: str) -> Receipt:
         """Move a reservation to captured (called by the settlement layer)."""
         permit = self.get(permit_id)
@@ -269,7 +405,7 @@ class PermitStore:
             assert amount is not None, "unknown auth_id"
             permit.reserved_cents -= amount
             permit.captured_cents += amount
-            return self.ledger.append(
+            receipt = self.ledger.append(
                 "CAPTURED",
                 {
                     "permit_id": permit_id,
@@ -278,6 +414,10 @@ class PermitStore:
                     "remaining_cents": permit.remaining_cents(),
                 },
             )
+        # Roll the capture up the delegation chain (outside the child lock:
+        # lock order is always ancestor-after-descendant via get()).
+        self._rollup_capture(permit, amount)
+        return receipt
 
     def settle_void(self, permit_id: str, auth_id: str) -> Receipt:
         """Release a reservation (called by the settlement layer on void)."""
@@ -318,3 +458,106 @@ class PermitStore:
                 },
             )
             return receipt, in_flight
+
+    def revoke_subtree(
+        self, permit_id: str
+    ) -> tuple[Receipt, dict[str, list[str]]]:
+        """
+        Revoke a permit and every descendant permit (cascade). Returns the
+        root receipt and {permit_id: [in-flight auth_ids]} for the whole
+        subtree, so the settlement layer can void every outstanding hold.
+
+        Unspent delegation carves are NOT released here — call
+        release_carve() per revoked child after in-flight holds are voided
+        (post-order: children before parents).
+
+        Concurrency note: delegate() and revoke_subtree() are each atomic,
+        but a delegate() racing revoke_subtree() may create a child after
+        the subtree was collected. Callers must serialize permit-graph
+        mutation (delegate vs revoke); spend-path races against revocation
+        are closed by the per-permit lock + capture-time re-admission.
+        """
+        root = self.get(permit_id)
+        assert root is not None, "unknown permit"
+        # Collect the subtree (parents before children) under the store lock.
+        with self._store_lock:
+            order = [permit_id]
+            queue = [permit_id]
+            while queue:
+                pid = queue.pop(0)
+                for cid in self._children.get(pid, []):
+                    order.append(cid)
+                    queue.append(cid)
+        in_flight: dict[str, list[str]] = {}
+        root_receipt: Receipt | None = None
+        for pid in order:
+            permit = self.get(pid)
+            if permit is None:
+                continue
+            with permit._lock:
+                ids = list(permit.in_flight.keys())
+                if ids:
+                    in_flight[pid] = ids
+                if permit.revoked:
+                    continue
+                permit.revoked = True
+                event = "E-STOP" if pid == permit_id else "REVOKED_CASCADE"
+                receipt = self.ledger.append(
+                    event,
+                    {
+                        "permit_id": pid,
+                        "agent_id": permit.agent_id,
+                        "in_flight_auth_ids": ids,
+                        "parent_id": permit.parent_id,
+                    },
+                )
+                if pid == permit_id:
+                    root_receipt = receipt
+        assert root_receipt is not None, "root permit vanished"
+        return root_receipt, in_flight
+
+    def release_carve(self, permit_id: str) -> Receipt | None:
+        """
+        Release a revoked child's unspent delegation carve back to its
+        parent. Call after in-flight holds are voided (so reserved reflects
+        only the carve), post-order: children before parents. Returns the
+        CARVE_RELEASED receipt, or None when there is nothing to release.
+        """
+        permit = self.get(permit_id)
+        if permit is None or permit.parent_id is None:
+            return None
+        parent = self.get(permit.parent_id)
+        if parent is None:
+            return None
+        # Lock order: parent before child, consistent with delegate().
+        with parent._lock:
+            with permit._lock:
+                if not permit.revoked:
+                    return None
+                if permit.parent_id is None:
+                    # Already released (idempotent).
+                    return None
+                unspent = (
+                    permit.cap_cents
+                    - permit.captured_cents
+                    - permit.reserved_cents
+                )
+                assert unspent >= 0, "delegation carve accounting went negative"
+                parent.reserved_cents -= unspent
+                parent_remaining = parent.remaining_cents()
+                parent_id = permit.parent_id
+                # Clear the link: a second call is a no-op.
+                permit.parent_id = None
+        with self._store_lock:
+            kids = self._children.get(parent_id, [])
+            if permit_id in kids:
+                kids.remove(permit_id)
+        return self.ledger.append(
+            "CARVE_RELEASED",
+            {
+                "child_permit_id": permit_id,
+                "parent_permit_id": parent_id,
+                "released_cents": unspent,
+                "parent_remaining_cents": parent_remaining,
+            },
+        )

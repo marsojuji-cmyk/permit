@@ -25,6 +25,16 @@ where `remaining(P) = cap(P) − reserved(P) − captured(P)`. Four clauses. No 
 
 Expiry is evaluated twice: at check time and at release time. A release attempted after expiry fails closed — the hold is voided, the reservation freed, no money moves.
 
+## Delegation: permits for teams of agents
+
+An agent holding a permit can carve a **sub-permit** out of its remaining cap for another agent — a buyer delegating to a researcher, a manager to a worker. The child permit cannot exceed the parent's remaining cap, cannot add merchants beyond the parent's allowlist, and cannot outlive the parent's expiry. The carved cap is reserved on the parent, so delegated budget can never be double-spent.
+
+Captures roll up: when the child captures, each ancestor moves reserved→captured by the same amount. Revoking a parent **cascades** — every descendant is revoked, in-flight holds are voided, and unspent carves are released back up the chain. Delegation never increases total spending power; it only subdivides it.
+
+```bash
+python3 demo_delegation.py --fast   # two LLM agents, five beats, live dashboard
+```
+
 ## The spend pipeline
 
 ```
