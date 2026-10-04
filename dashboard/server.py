@@ -45,6 +45,7 @@ class Dashboard:
                     "remaining_cents": p.remaining_cents(),
                     "revoked": p.revoked,
                     "allowlist": list(p.allowlist),
+                    "parent_id": p.parent_id,
                 })
         receipts = []
         if self.ledger:

@@ -36,6 +36,10 @@ Tools (one call per turn):
 Args: {"escrow_id": str}
 - check_permit: see your permit's remaining budget. \
 Args: {}
+- delegate_subpermit: carve a sub-permit out of your remaining cap for \
+another agent. Args: {"cap_cents": int, "agent_id": str, \
+"expiry_minutes": int}. The child inherits your merchant allowlist and \
+cannot outlive or outspend your permit.
 
 Rules:
 - Amounts are in cents (3000 = $30.00).
@@ -43,6 +47,8 @@ Rules:
 to dodge the cap. Report the refusal.
 - After an ALLOWED spend, call deliver with the escrow_id to complete \
 the purchase, then report the capture id - unless the task says not to.
+- Delegation never increases total spending power: the carved cap is \
+reserved on your permit until the child spends or is revoked.
 - Keep reasoning short.
 
 Respond in exactly this format each turn:
