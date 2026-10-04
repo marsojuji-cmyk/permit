@@ -36,6 +36,15 @@ Amount discipline (P1-3 witness fix): amounts are positive integers.
 _validate_amount() guards the authority boundary (check() and grant());
 an invalid amount never reserves, never raises through check() — it is
 recorded as a BLOCKED receipt with reason "invalid_amount".
+
+Tighten-only min-gate (v4): a live permit can be NARROWED after issuance
+via tighten() — lower cap, fewer merchants, sooner expiry — but never
+widened. A tighten cascades to every descendant: each child keeps the
+narrower of its own authority and the parent's new bound, so the whole
+subtree obeys the tightened mandate with no ancestor walk at check time.
+Every tighten writes a TIGHTEN receipt with old→new per narrowed clause;
+cascaded applications carry cascade_from. A tighten that would widen or
+leave authority unchanged is rejected.
 """
 
 from __future__ import annotations
@@ -46,6 +55,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .ledger import Ledger, Receipt
+
+
+class UnknownPermit(Exception):
+    """Raised when an operation names a permit id the store does not hold."""
 
 
 def _validate_amount(amount_cents) -> int:
@@ -93,6 +106,13 @@ class Permit:
     in_flight: dict[str, int] = field(default_factory=dict)
     # Delegation: set when this permit was carved out of a parent permit.
     parent_id: str | None = None
+    # Tighten overlays (v4 min-gate): post-issuance narrowings. Each is
+    # None until the first tighten touches that clause; tighten() only
+    # ever narrows, so the effective clause is the minimum/intersection
+    # of the granted value and every tighten overlay in the lineage.
+    tighten_cap_cents: int | None = None
+    tighten_allowlist: tuple[str, ...] | None = None
+    tighten_expiry: datetime | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -199,15 +219,20 @@ class PermitStore:
         # so this ordering cannot deadlock.
         with self._store_lock:
             with parent._lock:
+                # Carve against the parent's EFFECTIVE authority (tighten
+                # overlays included): a tightened parent cannot delegate
+                # what it can no longer spend.
+                eff_cap, _, eff_allow, eff_expiry, _ = self._effective(parent)
+                eff_remaining = eff_cap - parent.reserved_cents - parent.captured_cents
                 if parent.revoked:
                     reason = "parent_revoked"
-                elif now >= parent.expiry:
+                elif now >= eff_expiry:
                     reason = "parent_expired"
-                elif cap_cents > parent.remaining_cents():
+                elif cap_cents > eff_remaining:
                     reason = "over_parent_remaining"
-                elif not set(child_allowlist) <= set(parent.allowlist):
+                elif not set(child_allowlist) <= set(eff_allow):
                     reason = "allowlist_escalation"
-                elif expiry > parent.expiry:
+                elif expiry > eff_expiry:
                     reason = "expiry_beyond_parent"
                 else:
                     reason = None
@@ -251,21 +276,192 @@ class PermitStore:
                 )
                 return DelegateResult(True, "delegated", child, receipt)
 
+    def tighten(
+        self,
+        permit_id: str,
+        *,
+        cap_cents: int | None = None,
+        remove_merchants: list[str] | None = None,
+        expiry: datetime | None = None,
+        actor: str = "human",
+    ) -> tuple[Permit, Receipt]:
+        """
+        Narrow a live permit. Tighten-only: every supplied parameter must
+        strictly narrow the permit's current effective authority, otherwise
+        ValueError. At least one parameter is required.
+
+        - cap_cents: new cap, a positive int strictly below the current
+          effective cap. May go below reserved+captured (emergency):
+          in-flight holds stand, but no new attempt can reserve.
+        - remove_merchants: non-empty list; each must be in the current
+          effective allowlist; the result must stay non-empty (to kill
+          the permit, use e-stop).
+        - expiry: timezone-aware datetime, strictly sooner than the current
+          effective expiry and still in the future.
+        - actor: who ordered the tighten (recorded on the receipt).
+
+        Cannot tighten a revoked permit or one whose effective window has
+        passed — fail closed. Writes a TIGHTEN receipt with old→new for
+        every narrowed clause, then cascades to every descendant: each
+        child keeps the narrower of its own authority and the new bound
+        (cascade_from on the receipt). Tighten-only holds at every level —
+        a descendant already narrower than the new bound is untouched.
+        """
+        now = datetime.now(timezone.utc)
+        if cap_cents is None and not remove_merchants and expiry is None:
+            raise ValueError(
+                "tighten requires at least one of cap_cents, "
+                "remove_merchants, expiry"
+            )
+        if not isinstance(actor, str) or not actor.strip():
+            raise ValueError("actor must be a non-empty string")
+        actor = actor.strip()
+
+        # Validate the requested narrowing once, up front.
+        if cap_cents is not None:
+            _validate_amount(cap_cents)
+        if remove_merchants is not None and (
+            not isinstance(remove_merchants, list)
+            or not remove_merchants
+            or not all(isinstance(m, str) and m.strip() for m in remove_merchants)
+        ):
+            raise ValueError(
+                "remove_merchants must be a non-empty list of merchant id strings"
+            )
+        rm = {m.strip() for m in remove_merchants} if remove_merchants else set()
+        if expiry is not None:
+            if expiry.tzinfo is None:
+                raise ValueError("expiry must be timezone-aware")
+            if expiry <= now:
+                raise ValueError("tighten expiry must be in the future")
+
+        permit = self.get(permit_id)
+        if permit is None:
+            raise UnknownPermit(permit_id)
+
+        # Apply to the target, then cascade breadth-first (parents before
+        # children). Each permit is locked individually while updated — no
+        # nested locking, so no new lock order is introduced.
+        queue: list[tuple[str, str | None]] = [(permit_id, None)]
+        seen = {permit_id}
+        first_receipt: Receipt | None = None
+        while queue:
+            pid, cascade_from = queue.pop(0)
+            target = self.get(pid)
+            if target is None:
+                continue
+            with target._lock:
+                if target.revoked:
+                    continue
+                eff_cap, _, eff_allow, eff_expiry, _ = self._effective(target)
+                if now >= eff_expiry:
+                    continue
+                changes: dict[str, dict] = {}
+                if cap_cents is not None and cap_cents < eff_cap:
+                    changes["cap_cents"] = {"from": eff_cap, "to": cap_cents}
+                if rm:
+                    if rm <= set(eff_allow):
+                        new_allow = set(eff_allow) - rm
+                        if new_allow:
+                            changes["allowlist"] = {
+                                "from": sorted(eff_allow),
+                                "to": sorted(new_allow),
+                                "removed": sorted(rm),
+                            }
+                if expiry is not None and expiry < eff_expiry:
+                    changes["expiry"] = {
+                        "from": eff_expiry.isoformat(),
+                        "to": expiry.isoformat(),
+                    }
+                if not changes:
+                    # Already narrower than the new bound (tighten-only):
+                    # untouched, but the cascade still flows below.
+                    pass
+                else:
+                    if "cap_cents" in changes:
+                        target.tighten_cap_cents = cap_cents
+                    if "allowlist" in changes:
+                        base = (
+                            set(target.tighten_allowlist)
+                            if target.tighten_allowlist is not None
+                            else set(target.allowlist)
+                        )
+                        target.tighten_allowlist = tuple(sorted(base - rm))
+                    if "expiry" in changes:
+                        target.tighten_expiry = expiry
+                    payload: dict = {
+                        "permit_id": target.permit_id,
+                        "agent_id": target.agent_id,
+                        "actor": actor,
+                        "changes": changes,
+                    }
+                    if cascade_from is not None:
+                        payload["cascade_from"] = cascade_from
+                    receipt = self.ledger.append("TIGHTEN", payload)
+                    if first_receipt is None:
+                        first_receipt = receipt
+            # Queue children regardless of whether this level narrowed —
+            # a grandchild may still be wider than the new bound.
+            with self._store_lock:
+                kids = list(self._children.get(pid, []))
+            for cid in kids:
+                if cid not in seen:
+                    seen.add(cid)
+                    queue.append((cid, pid))
+        if first_receipt is None:
+            # The target itself was already narrower than every requested
+            # bound: tighten-only rejects the no-op.
+            raise ValueError(
+                "tighten changes nothing: permit is already at or below "
+                "every requested bound (tighten-only)"
+            )
+        return permit, first_receipt
+
+    @staticmethod
+    def _effective(
+        permit: Permit,
+    ) -> tuple[int, bool, frozenset[str], datetime, bool]:
+        """
+        Per-permit min-gate: the narrowest of the granted clauses and the
+        tighten overlays. Returns (cap_cents, cap_tightened, allowlist,
+        expiry, expiry_tightened). Ancestor tightens arrive via cascade at
+        tighten() time, so no lineage walk is needed at check time.
+        Caller must hold permit._lock.
+        """
+        cap = permit.cap_cents
+        cap_tightened = False
+        if permit.tighten_cap_cents is not None and permit.tighten_cap_cents < cap:
+            cap = permit.tighten_cap_cents
+            cap_tightened = True
+        allow = set(permit.allowlist)
+        if permit.tighten_allowlist is not None:
+            allow &= set(permit.tighten_allowlist)
+        expiry = permit.expiry
+        expiry_tightened = False
+        if permit.tighten_expiry is not None and permit.tighten_expiry < expiry:
+            expiry = permit.tighten_expiry
+            expiry_tightened = True
+        return cap, cap_tightened, frozenset(allow), expiry, expiry_tightened
+
     @staticmethod
     def _evaluate(permit: Permit, amount_cents: int, merchant_id: str, now: datetime) -> str | None:
         """
-        The 4-clause authority evaluation. Returns the block reason, or
-        None when the attempt is allowed. Caller must hold permit._lock.
-        Amount is assumed pre-validated by _validate_amount.
+        The 4-clause authority evaluation through the tighten-only min-gate.
+        Returns the block reason, or None when the attempt is allowed.
+        Caller must hold permit._lock. Amount is assumed pre-validated by
+        _validate_amount.
         """
         if permit.revoked:
             return "revoked"
-        if now >= permit.expiry:
-            return "expired"
-        if merchant_id not in permit.allowlist:
+        cap, cap_tightened, allow, expiry, expiry_tightened = (
+            PermitStore._effective(permit)
+        )
+        if now >= expiry:
+            return "tightened_expiry_passed" if expiry_tightened else "expired"
+        if merchant_id not in allow:
             return "merchant_not_allowed"
-        if amount_cents > permit.remaining_cents():
-            return "over_remaining_cap"
+        if amount_cents > cap - permit.reserved_cents - permit.captured_cents:
+            return "tightened_cap_exceeded" if cap_tightened else "over_remaining_cap"
         return None
 
     def eligible(
