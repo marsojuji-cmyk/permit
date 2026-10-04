@@ -54,7 +54,6 @@ from settlement.verifier import (
     Evidence,
     PredicateType,
     ReleaseVerifier,
-    sign_acceptance,
 )
 
 # ---------------------------------------------------------------- state
