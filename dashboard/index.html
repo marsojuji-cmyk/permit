@@ -62,8 +62,6 @@
   .ev.AUTHORIZED{color:var(--blue);} .ev.CAPTURED{color:var(--green);}
   .ev.BLOCKED{color:var(--amber);} .ev.REFUSED{color:var(--red);}
   .ev.VOIDED{color:var(--amber);} .ev.REVOKED{color:var(--red);}
-  .ev.DELEGATED{color:var(--blue);} .ev.REVOKED_CASCADE{color:var(--red);}
-  .ev.CARVE_RELEASED{color:var(--green);} .ev.E-STOP{color:var(--red);}
   .detail { color:var(--dim); }
   .empty { color:var(--dim); font-style:italic; padding:12px 0; }
   #err { color:var(--red); font-size:12px; margin-bottom:12px; display:none; }
@@ -78,7 +76,6 @@
 <div class="grid">
   <div>
     <div class="card"><h2>Permits</h2><div id="permits"></div></div>
-    <div class="card"><h2>Pending approvals</h2><div id="approvals"></div></div>
     <div class="card"><h2>In-flight escrows</h2><div id="escrows"></div></div>
   </div>
   <div class="card"><h2>Receipt chain</h2><div id="chain"></div></div>
@@ -100,22 +97,8 @@ function receiptDetail(r){
     case "REFUSED": return esc(p.reason||"");
     case "VOIDED": return `escrow ${esc((p.escrow_id||"").slice(0,12))}…`;
     case "REVOKED": return `permit ${esc((p.permit_id||"").slice(0,12))}…`;
-    case "E-STOP": return `permit ${esc((p.permit_id||"").slice(0,12))}… revoked`;
-    case "DELEGATED": return `cap ${cents(p.cap_cents)} · child of ${esc((p.parent_id||"").slice(0,12))}… · ${esc(p.agent_id||"")}`;
-    case "REVOKED_CASCADE": return `cascade from ${esc((p.parent_id||"").slice(0,12))}… · revoked ${esc((p.permit_id||"").slice(0,12))}…`;
-    case "CARVE_RELEASED": return `${cents(p.released_cents||0)} back to parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
-    case "APPROVAL_REQUESTED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")} · needs principal`;
-    case "APPROVAL_DECIDED": return `${esc(p.decision||"")} · ${esc(p.actor||"")}`;
-    case "APPROVAL_PENDING": return `${cents(p.amount_cents)} · waiting on principal`;
     default: return "";
   }
-}
-
-async function decideApproval(id, approve){
-  const res = await fetch(`/api/approvals/${id}/${approve?"approve":"deny"}`,{method:"POST"});
-  const j = await res.json();
-  if(!j.ok) alert("decision failed: "+(j.error||"unknown"));
-  refresh();
 }
 
 async function estop(pid){
@@ -141,7 +124,6 @@ async function refresh(){
       const pct = p.cap_cents ? Math.max(0,100*p.remaining_cents/p.cap_cents) : 0;
       return `<div class="permit card ${p.revoked?"revoked":""}">
         <div class="mono" style="color:var(--dim)">${esc(p.permit_id)}</div>
-        ${p.parent_id?`<div class="mono" style="color:var(--dim);font-size:11px">sub-permit of ${esc(p.parent_id.slice(0,14))}…</div>`:""}
         <div class="money">${cents(p.remaining_cents)} <small>remaining of ${cents(p.cap_cents)}</small></div>
         <div class="bar"><i style="width:${pct}%"></i></div>
         <div class="kv"><span>reserved</span><b>${cents(p.reserved_cents)}</b></div>
@@ -158,15 +140,6 @@ async function refresh(){
         ${cents(e.amount_cents)}</span>
         <span class="st ${e.state}">${e.state}</span></div>`
     ).join("") : `<div class="empty">no escrows in flight</div>`;
-
-    $("approvals").innerHTML = (s.approvals||[]).length ? s.approvals.map(a=>
-      `<div class="escrow"><span>${cents(a.amount_cents)} · ${esc(a.merchant_id)}<br>
-        <span class="mono" style="color:var(--dim)">${esc(a.agent_id)} · expires ${esc(a.expires_at.slice(11,16))} UTC</span></span>
-        <span><button class="st" style="color:var(--green);border-color:var(--green);background:none;cursor:pointer;margin-right:6px"
-          onclick="decideApproval('${esc(a.approval_id)}',true)">APPROVE</button><button class="st"
-          style="color:var(--red);border-color:var(--red);background:none;cursor:pointer"
-          onclick="decideApproval('${esc(a.approval_id)}',false)">DENY</button></span></div>`
-    ).join("") : `<div class="empty">no pending approvals</div>`;
 
     $("chain").innerHTML = s.receipts.length ? [...s.receipts].reverse().map(r=>
       `<div class="rcpt"><span class="seq">#${String(r.seq).padStart(2,"0")}</span>

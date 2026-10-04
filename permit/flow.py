@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 
 from .ledger import Ledger, Receipt
 from .permit import PermitStore
-from settlement.verifier import Escrow, PredicateType
+from settlement.verifier import Escrow
 
 
 @dataclass(frozen=True)
@@ -51,8 +51,6 @@ class SpendAttempt:
     reason: str
     escrow_id: str | None
     receipts: tuple[Receipt, ...]
-    # Set when the attempt is gated on principal approval.
-    approval_id: str | None = None
 
 
 class ApprovalRequired(Exception):
@@ -168,20 +166,10 @@ class SpendPipeline:
         merchant_id: str,
         predicate_type,
         artifact_hash: str,
-        approval_id: str | None = None,
     ) -> SpendAttempt:
         """
         One spend attempt. Returns ALLOWED + escrow_id on success, or
         BLOCKED with the receipt and zero PayPal traffic.
-
-        Principal approvals: when the permit's approval threshold is set
-        and amount_cents exceeds it, the attempt does NOT reserve — it
-        returns pending_principal_approval with an approval_id. The
-        principal approves/denies out of band; complete_approved_spend()
-        then re-runs the full authority check (fail-closed if the budget
-        moved). Pass approval_id to execute an already-approved request;
-        the id binds the exact (permit, amount, merchant) — anything else
-        is rejected as invalid_approval.
 
         With the real sandbox client, paypal.authorize() may raise
         NeedsPayerApproval: the cap reservation stays held and the caller
@@ -205,89 +193,11 @@ class SpendPipeline:
             )
             return SpendAttempt(False, "merchant_not_bound", None, (receipt,))
 
-        # (6a2) Principal-approval gate. Runs BEFORE check() so a pending
-        # request never reserves cap.
-        if approval_id is not None:
-            approval = self.permits.get_approval(approval_id)
-            if (
-                approval is None
-                or approval.status != "approved"
-                or approval.permit_id != permit_id
-                or approval.amount_cents != amount_cents
-                or approval.merchant_id != merchant_id
-            ):
-                receipt = self.ledger.append(
-                    "BLOCKED",
-                    {
-                        "permit_id": permit_id,
-                        "amount_cents": amount_cents
-                        if isinstance(amount_cents, int)
-                        else repr(amount_cents),
-                        "merchant_id": merchant_id,
-                        "reason": "invalid_approval",
-                        "approval_id": approval_id,
-                    },
-                )
-                return SpendAttempt(False, "invalid_approval", None, (receipt,))
-        else:
-            threshold = self.permits.approval_threshold(permit_id)
-            if (
-                threshold is not None
-                and isinstance(amount_cents, int)
-                and not isinstance(amount_cents, bool)
-                and amount_cents > threshold
-            ):
-                # The 4-clause check must pass first: no approval request
-                # for a spend the authority would refuse anyway.
-                probe = self.permits.eligible(
-                    permit_id, amount_cents, merchant_id
-                )
-                if probe.allowed:
-                    predicate_value = (
-                        predicate_type.value
-                        if hasattr(predicate_type, "value")
-                        else str(predicate_type)
-                    )
-                    approval = self.permits.request_approval(
-                        permit_id,
-                        amount_cents,
-                        merchant_id,
-                        predicate_value,
-                        artifact_hash,
-                    )
-                    receipt = self.ledger.append(
-                        "APPROVAL_PENDING",
-                        {
-                            "permit_id": permit_id,
-                            "amount_cents": amount_cents,
-                            "merchant_id": merchant_id,
-                            "reason": "pending_principal_approval",
-                            "approval_id": approval.approval_id,
-                            "threshold_cents": threshold,
-                        },
-                    )
-                    return SpendAttempt(
-                        False,
-                        "pending_principal_approval",
-                        None,
-                        (receipt,),
-                        approval.approval_id,
-                    )
-                # else: fall through to check() for the authoritative BLOCKED.
-
         # (6b) check() as before (ALLOWED reserves cap).
         check = self.permits.check(permit_id, amount_cents, merchant_id)
         if not check.allowed:
             # BLOCKED: receipt written by check(). PayPal is never called.
-            # An unconsumed approval stays approved: the principal's word
-            # stands; only the authority recheck failed. The agent may
-            # retry complete_approved_spend() later.
             return SpendAttempt(False, check.reason, None, (check.receipt,))
-
-        if approval_id is not None:
-            # The principal's word is now spent: single-consumption, so one
-            # approval can never authorize two holds.
-            self.permits.consume_approval(approval_id)
 
         auth_id = check.receipt.payload["auth_id"]
         # (6c) Track the outstanding operation BEFORE the external call,
@@ -488,49 +398,6 @@ class SpendPipeline:
     def release(self, escrow_id: str, evidence):
         """Evidence in, money out - or a REFUSED receipt. Pass-through."""
         return self.verifier.verify_and_capture(escrow_id, evidence)
-
-    def approve_approval(
-        self, approval_id: str, actor: str = "human"
-    ):
-        """
-        The principal's word: approve a pending above-threshold spend.
-        Approval alone moves no money; the agent completes it with
-        complete_approved_spend(), which re-runs the authority check.
-        """
-        return self.permits.decide_approval(approval_id, True, actor=actor)
-
-    def deny_approval(
-        self, approval_id: str, actor: str = "human"
-    ):
-        """The principal refuses: the spend can never complete."""
-        return self.permits.decide_approval(approval_id, False, actor=actor)
-
-    def complete_approved_spend(self, approval_id: str) -> SpendAttempt:
-        """
-        Execute a principal-approved spend. The approval binds the exact
-        (permit, amount, merchant, predicate, artifact): spend() re-runs
-        the full authority check with the stored parameters, so a budget
-        that moved since approval fails closed.
-        """
-        approval = self.permits.get_approval(approval_id)
-        if approval is None or approval.status != "approved":
-            receipt = self.ledger.append(
-                "BLOCKED",
-                {
-                    "permit_id": approval.permit_id if approval else None,
-                    "reason": "approval_not_approved",
-                    "approval_id": approval_id,
-                },
-            )
-            return SpendAttempt(False, "approval_not_approved", None, (receipt,))
-        return self.spend(
-            approval.permit_id,
-            approval.amount_cents,
-            approval.merchant_id,
-            PredicateType(approval.predicate_type),
-            approval.artifact_hash,
-            approval_id=approval_id,
-        )
 
     def delegate(
         self,

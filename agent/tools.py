@@ -46,20 +46,6 @@ class SpendTools:
             PredicateType.D, artifact_hash,
         )
         if not attempt.allowed:
-            if attempt.reason == "pending_principal_approval":
-                return json.dumps({
-                    "ok": False,
-                    "decision": "PENDING",
-                    "reason": "pending_principal_approval",
-                    "approval_id": attempt.approval_id,
-                    "message": (
-                        f"Spend of ${amount_cents/100:.2f} exceeds your "
-                        "permit's approval threshold and needs the "
-                        "principal's word. Use check_approval to poll, "
-                        "then complete_approved_spend once approved."
-                    ),
-                    "paypal_called": False,
-                })
             return json.dumps({
                 "ok": False,
                 "decision": "BLOCKED",
@@ -138,51 +124,6 @@ class SpendTools:
             "parent_remaining_cents": self.flow.permits.get(
                 self.permit_id
             ).remaining_cents(),
-        })
-
-    def check_approval(self, approval_id: str) -> str:
-        """Poll a principal-approval request: pending/approved/denied/expired."""
-        approval = self.flow.permits.get_approval(approval_id)
-        if approval is None:
-            return json.dumps({"ok": False, "error": "unknown approval"})
-        return json.dumps({
-            "ok": True,
-            "approval_id": approval.approval_id,
-            "status": approval.status,
-            "amount_cents": approval.amount_cents,
-            "merchant_id": approval.merchant_id,
-            "expires_at": approval.expires_at,
-        })
-
-    def complete_approved_spend(self, approval_id: str) -> str:
-        """
-        Execute a principal-approved spend. Only the exact approved
-        (amount, merchant) can complete; the authority check re-runs.
-        """
-        attempt = self.flow.complete_approved_spend(approval_id)
-        if not attempt.allowed:
-            return json.dumps({
-                "ok": False,
-                "decision": "BLOCKED",
-                "reason": attempt.reason,
-                "paypal_called": False,
-            })
-        # Mirror attempt_spend's success shape so the agent's deliver()
-        # flow works unchanged.
-        auth_receipt = attempt.receipts[1]
-        approval = self.flow.permits.get_approval(approval_id)
-        # Register the escrow's catalog purpose (reverse-lookup by artifact
-        # hash) so deliver() can submit the matching bytes.
-        for purpose, blob in self.catalog.items():
-            if hashlib.sha256(blob).hexdigest() == approval.artifact_hash:
-                self._escrow_purpose[attempt.escrow_id] = purpose
-                break
-        return json.dumps({
-            "ok": True,
-            "decision": "ALLOWED",
-            "escrow_id": attempt.escrow_id,
-            "paypal_auth_id": auth_receipt.payload.get("paypal_auth_id"),
-            "amount_cents": approval.amount_cents,
         })
 
     # -- harness-only (NOT exposed to the LLM) ------------------------------

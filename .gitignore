@@ -4,4 +4,3 @@ __pycache__/
 .env
 *.egg-info/
 demo_transcript.jsonl
-.env.sandbox

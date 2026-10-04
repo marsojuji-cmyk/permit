@@ -70,25 +70,12 @@ class Dashboard:
                     "paypal_auth_id": e.paypal_auth_id,
                 })
         chain_ok, chain_reason = self.ledger.verify_chain() if self.ledger else (True, "")
-        approvals = []
-        if self.permits:
-            for a in self.permits.pending_approvals():
-                approvals.append({
-                    "approval_id": a.approval_id,
-                    "permit_id": a.permit_id,
-                    "agent_id": a.agent_id,
-                    "amount_cents": a.amount_cents,
-                    "merchant_id": a.merchant_id,
-                    "status": a.status,
-                    "expires_at": a.expires_at,
-                })
         return {
             "permits": permits,
             "escrows": escrows,
             "receipts": receipts,
             "chain_ok": chain_ok,
             "chain_reason": chain_reason,
-            "approvals": approvals,
         }
 
     def estop(self, permit_id: str) -> dict:
@@ -96,19 +83,6 @@ class Dashboard:
             return {"ok": False, "error": "no flow bound"}
         receipt, voided = self.flow.estop(permit_id)
         return {"ok": True, "receipt_seq": receipt.seq, "voided": voided}
-
-    def decide_approval(self, approval_id: str, approved: bool) -> dict:
-        if not self.flow:
-            return {"ok": False, "error": "no flow bound"}
-        try:
-            if approved:
-                self.flow.approve_approval(approval_id, actor="dashboard")
-            else:
-                self.flow.deny_approval(approval_id, actor="dashboard")
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
-        return {"ok": True, "approval_id": approval_id,
-                "decision": "approved" if approved else "denied"}
 
     # -- http ---------------------------------------------------------------
 
@@ -142,14 +116,6 @@ class Dashboard:
                     body = json.loads(self.rfile.read(length) or b"{}")
                     self._send(200, json.dumps(
                         dash.estop(body.get("permit_id", ""))))
-                elif self.path.startswith("/api/approvals/"):
-                    # /api/approvals/<id>/approve | /deny
-                    parts = self.path.split("/")
-                    if len(parts) == 5 and parts[4] in ("approve", "deny"):
-                        self._send(200, json.dumps(dash.decide_approval(
-                            parts[3], parts[4] == "approve")))
-                    else:
-                        self._send(404, b'{"error":"not found"}')
                 else:
                     self._send(404, b'{"error":"not found"}')
 
