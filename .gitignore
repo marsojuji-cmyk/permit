@@ -4,3 +4,9 @@ __pycache__/
 .env
 *.egg-info/
 demo_transcript.jsonl
+.env.sandbox
+
+# editor/agent config and internal scoring notes (kept out of the public tree)
+.cursor/
+CLIMB-SCORE.md
+runs/

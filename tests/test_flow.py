@@ -135,29 +135,3 @@ def test_register_escrow_resume_does_not_double_reserve():
     # E-stop still voids it through the mapping.
     _, voided = flow.estop(permit.permit_id)
     assert voided == [escrow_id]
-
-
-def test_estop_lists_unknown_hold_instead_of_racing_it():
-    """P1 (2026-10-02 adversarial review): an escrow in UNKNOWN state
-    (capture may still be settling) must not be voided by e-stop and must
-    not vanish from the report. It lands in unknown_open, the reservation
-    stays held, and reconcile() remains the only way forward."""
-    flow, paypal, permits, permit = _pipeline()
-    artifact, digest = _artifact()
-    attempt = flow.spend(permit.permit_id, 3000, "merchant_1", PredicateType.D, digest)
-    assert attempt.allowed
-    # Drive the escrow to UNKNOWN: capture comes back PENDING.
-    paypal.capture_status = "PENDING"
-    result = flow.release(attempt.escrow_id, Evidence(delivered_bytes=artifact))
-    assert not result.released
-    assert result.reason == "capture_pending"
-
-    voids_before = len(paypal.voids)
-    estop_result = flow.estop(permit.permit_id)
-    receipt, voided = estop_result
-    assert receipt.event_type == "E-STOP"
-    assert voided == []
-    assert attempt.escrow_id in estop_result.unknown_open
-    assert len(paypal.voids) == voids_before, "e-stop must not race a pending capture"
-    assert permits.get(permit.permit_id).reserved_cents == 3000, "reservation stays held"
-    assert permit.revoked

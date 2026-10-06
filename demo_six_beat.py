@@ -10,8 +10,10 @@ Beats:
   2. Agent buys the $30 dataset license -> ALLOWED -> hold -> deliver ->
      capture id appears.
   3. Agent tries the $60 premium tier -> BLOCKED ($20 left). No PayPal id.
-  4. New permit, agent holds $10 in flight -> human hits E-STOP ->
-     permit revoked, escrow voided -> release refused.
+  4. The budget owner delegates a $15 sub-permit (carved from the parent's
+     remaining cap). The child holds $10. The parent is revoked -> the
+     cascade revokes the child (REVOKED_CASCADE), the hold is voided, the
+     unspent carve is released, a later delivery is refused.
   5. Agent holds $15 -> worker submits tampered bytes -> REFUSED, no capture.
   6. Agent holds $25 -> the capture applies at PayPal but the response is
      dropped -> escrow goes UNKNOWN (never optimistically claimed) ->
@@ -85,6 +87,11 @@ def show_receipts(ledger, since: int):
         print(f"  #{r.seq:02d} {r.event_type:10s} {detail}")
 
 
+def require(cond: bool, message: str) -> None:
+    if not cond:
+        raise AssertionError(f"demo requirement failed: {message}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replay", default=None)
@@ -136,30 +143,69 @@ def main():
     print(f"  PayPal authorize calls: {len(paypal.authorizations)} "
           f"(unchanged: {len(paypal.authorizations) == before})")
 
-    # -- beat 4: e-stop mid-hold --------------------------------------------
-    beat(4, "e-stop: revoke mid-hold, void the authorization", args.fast)
+    # -- beat 4: delegated sub-permit, then cascade revoke -------------------
+    # The carve-out model: the $15 child is carved from the parent's remaining
+    # cap (reserved on the parent at delegation). Revoking the parent
+    # cascades: the child is revoked (REVOKED_CASCADE), its in-flight hold is
+    # voided, and the unspent carve is released post-order.
+    beat(4, "delegate a $15 sub-permit; child holds $10; revoke parent cascades",
+         args.fast)
     mark = len(ledger)
-    permit2, _ = permits.grant(
-        agent_id="demo_agent", cap_cents=5000, allowlist=[MERCHANT],
+    parent, _ = permits.grant(
+        agent_id="budget_owner", cap_cents=5000, allowlist=[MERCHANT],
         expiry=datetime.now(timezone.utc) + timedelta(hours=1),
     )
-    tools2 = SpendTools(flow, permit2.permit_id, MERCHANT, CATALOG)
+    res = permits.delegate(
+        parent.permit_id, "buying_agent", 1500, [MERCHANT],
+        parent.expiry - timedelta(minutes=5),
+    )
+    require(res.ok, f"beat 4 delegate must succeed, got: {res.reason}")
+    child = res.permit
+    print(f"  parent {parent.permit_id} cap $50.00 agent=budget_owner")
+    print(f"  child  {child.permit_id} cap $15.00 (carved, narrowed) "
+          f"agent=buying_agent")
+    print(f"  parent remaining after carve: "
+          f"${parent.remaining_cents()/100:.2f}")
+    require(res.receipt.event_type == "DELEGATED",
+            "beat 4 missing DELEGATED receipt")
+    require(child.parent_id == parent.permit_id,
+            "beat 4 child must name its parent")
+    require(child.cap_cents == 1500,
+            "beat 4 child cap must be the carved $15")
+    tools_child = SpendTools(flow, child.permit_id, MERCHANT, CATALOG)
     answer = run_agent(
-        tools2, "Buy api credits for $10.00 from dataset_mart. Attempt the "
+        tools_child, "Buy api credits for $10.00 from dataset_mart. Attempt the "
                 "spend only - do NOT call deliver; the merchant delivers "
                 "separately.",
         transcript, replay=args.replay, beat=4)
-    # find the in-flight escrow
+    print(f"  agent: {answer}")
     escrow_id = next(e["escrow_id"] for e in dash.state()["escrows"]
-                     if e["permit_id"] == permit2.permit_id
+                     if e["permit_id"] == child.permit_id
                      and e["state"] == "AUTHORIZED")
-    print(f"  escrow {escrow_id[:14]}... in flight; human hits E-STOP")
-    receipt, voided = flow.estop(permit2.permit_id)
+    print(f"  child escrow {escrow_id[:14]}... in flight; "
+          f"human revokes the PARENT")
+    receipt, voided = flow.revoke_cascade(parent.permit_id)
     show_receipts(ledger, mark)
-    # the agent tries to deliver anyway -> refused
-    obs = json.loads(tools2.deliver(escrow_id))
-    print(f"  post-e-stop deliver: released={obs['released']} "
+    cascaded = [r for r in ledger.receipts()[mark:]
+                if r.event_type == "REVOKED_CASCADE"]
+    print(f"  cascade: {len(cascaded)} descendant(s) revoked. "
+          f"voids confirmed: {len(voided)}.")
+    print(f"  parent remaining ${parent.remaining_cents()/100:.2f} "
+          f"revoked={parent.revoked} (unspent carve released)")
+    # a late delivery against the revoked child must be refused
+    obs = json.loads(tools_child.deliver(escrow_id))
+    print(f"  post-cascade deliver: released={obs['released']} "
           f"reason={obs['reason']}")
+    require(receipt.event_type == "E-STOP", "beat 4 missing E-STOP receipt")
+    require(len(cascaded) == 1
+            and cascaded[0].payload["permit_id"] == child.permit_id,
+            "beat 4 cascade must revoke exactly the child")
+    require(parent.revoked and child.revoked,
+            "beat 4 cascade must revoke parent and child")
+    require(escrow_id in voided,
+            "beat 4 cascade did not void the child's in-flight escrow")
+    require(not obs["released"],
+            "beat 4 delivery after cascade must be refused")
 
     # -- beat 5: tampered evidence -------------------------------------------
     beat(5, "mismatched evidence is REFUSED (no capture)", args.fast)

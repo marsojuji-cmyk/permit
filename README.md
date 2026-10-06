@@ -25,6 +25,24 @@ where `remaining(P) = cap(P) − reserved(P) − captured(P)`. Four clauses. No 
 
 Expiry is evaluated twice: at check time and at release time. A release attempted after expiry fails closed — the hold is voided, the reservation freed, no money moves.
 
+## Delegation: permits for teams of agents
+
+An agent holding a permit can carve a **sub-permit** out of its remaining cap for another agent — a buyer delegating to a researcher, a manager to a worker. The child permit cannot exceed the parent's remaining cap, cannot add merchants beyond the parent's allowlist, and cannot outlive the parent's expiry. The carved cap is reserved on the parent, so delegated budget can never be double-spent.
+
+Captures roll up: when the child captures, each ancestor moves reserved→captured by the same amount. Revoking a parent **cascades** — every descendant is revoked, in-flight holds are voided, and unspent carves are released back up the chain. Delegation never increases total spending power; it only subdivides it.
+
+```bash
+python3 demo_delegation.py --fast   # two LLM agents, five beats, live dashboard
+```
+
+## Principal approvals: a human word on big spends
+
+A permit can carry an **approval threshold**. Spends at or below it flow through the normal authority check; spends above it don't reserve, don't touch PayPal, and come back `PENDING` with an approval id. The principal approves or denies from the dashboard — and approval is a word, not a lock: `complete_approved_spend()` re-runs the full authority check against the *stored* (permit, amount, merchant), so a budget that moved since approval fails closed. Denied approvals can never complete; completed approvals are single-use. Pending requests expire (15 minutes default). Thresholds are tighten-only: they can be set and lowered on a live permit, never raised.
+
+```bash
+python3 demo_approval.py --fast   # LLM agent, five beats: auto-allow, approve, deny, fail-closed
+```
+
 ## The spend pipeline
 
 ```
@@ -93,18 +111,18 @@ credential-free. Use it only when that service is configured:
 python demo_six_beat.py    # mock payment rail, external agent runner
 python server.py           # the service: http://127.0.0.1:8741
 python trace.py            # drives the live server: allowed flow, blocked
-                           # attempt that never touches PayPal, e-stop void,
-                           # ledger chain verification
+                           # attempt that never touches PayPal, delegate +
+                           # cascade revoke, ledger chain verification
 ```
 
-The six beats (mock payment rail, with the external agent runner by default): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → e-stop voids a mid-hold authorization → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture. This is not a recorded integrated PayPal run.
+The six beats (mock payment rail, with the external agent runner by default): grant → $30 honest purchase captured → $60 over-cap blocked with PayPal untouched → delegate a $15 sub-permit, child holds $10, revoke the parent cascades (child revoked, hold voided, carve released) → tampered evidence refused with hold voided → dropped capture response goes UNKNOWN and reconciles to the provider truth with exactly one capture. This is not a recorded integrated PayPal run.
 
-The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`), check authority (read-only: no reservation, no receipt), spend, resume an approval (`POST /api/operations/<id>/resume`), release an escrow, reconcile, retry cleanup, e-stop a permit, and read the ledger (`GET /api/ledger`). Mock mode is the default; `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive payer approval per order; set `PERMIT_PAYPAL_MERCHANT_ID` to enable merchant binding).
+The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`), delegate a sub-permit (`POST /api/permits/<id>/delegate`), check authority (read-only: no reservation, no receipt), spend, resume an approval (`POST /api/operations/<id>/resume`), release an escrow, reconcile, retry cleanup, e-stop a permit, revoke a permit and its whole subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default; `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET` and interactive payer approval per order; set `PERMIT_PAYPAL_MERCHANT_ID` to enable merchant binding).
 
 ## Which evidence is which
 
-- `demo_six_beat.py` — **mock rail with an optional external agent runner**: the payment client is mock, but the default agent path requires its configured service. `--replay` only reads/logs saved transcript text; it does not complete the six-beat pipeline offline, and no public replay fixture is claimed.
-- `spike.py` / `spike-report.md` — **separately recorded sandbox evidence** (Oct 2 spike): real REST calls, order/authorize/capture/void against PayPal sandbox, merchant identity verified.
+- `demo_six_beat.py` — **mock payment rail with an optional external agent runner**: the payment client is mock, but the default agent path requires its configured service. `--replay` only reads/logs saved transcript text; it does not complete the six-beat pipeline offline, and no public replay fixture is claimed.
+- Oct 2 sandbox spike — **API observations, not a repo artifact**: real REST calls (order/authorize/capture/void against PayPal sandbox, merchant identity verified). The spike scripts were removed from the tree; the facts live in `docs/sandbox-runbook.md`, labeled as API observations.
 - `docs/sandbox-runbook.md` — the **scripted procedure** for an integrated six-beat sandbox run (needs credentials + interactive approval). The integrated sandbox run is a procedure to execute, not a recorded artifact yet.
 
 ## Production boundaries (stated plainly)
