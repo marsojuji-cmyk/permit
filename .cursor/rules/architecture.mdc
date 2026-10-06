@@ -1,0 +1,53 @@
+---
+description: Module map and data flow for the Permit codebase
+alwaysApply: true
+---
+
+# Permit architecture
+
+## Modules
+
+| Path | Role |
+|---|---|
+| `permit/permit.py` | Permit grant, authority check, revocation, delegation (sub-permits) |
+| `permit/ledger.py` | Claim ledger — append-only SHA-256 hash chain, verified before capture |
+| `permit/flow.py` | Spend pipeline: check → reserve → authorize → escrow → evidence → capture |
+| `settlement/paypal_client.py` | PayPal REST client (auth, orders, authorize, capture, void) |
+| `settlement/sandbox_client.py` | `SandboxPayPalClient` — merchant-bound sandbox implementation |
+| `settlement/verifier.py` | ReleaseVerifier — delivery-evidence predicate evaluation |
+| `agent/react.py`, `agent/tools.py` | Demo agent: ReAct loop, tools constrained to its permit |
+| `server.py` | Flask service: `/api/permits`, `/spend`, `/operations/<id>/resume`, `/escrows/<id>/release`, `/reconcile`, `/retry-cleanup`, `/estop`, `/api/ledger`, dashboard |
+| `trace.py` | Trace/explain tooling for receipts |
+| `demo*.py` | Camera-ready demos (mock mode): `demo.py`, `demo_six_beat.py`, `demo_approval.py`, `demo_delegation.py`, `demo_sla_escrow.py` |
+| `launch_sandbox.py` | Sandbox launch helper (live beats against the real rail) |
+| `scripts/sandbox_smoke.py` | Credential-gated live smoke test |
+| `tests/` | Full suite — mock rail only, no credentials, no network |
+| `docs/` | `sandbox-runbook.md` (live procedure), `scenarios.md`, `submission-checklist.md` |
+
+## Spend pipeline (the spine)
+
+```
+check → reserve cap → PayPal AUTHORIZE hold → escrow registered
+      → evidence in → predicate evaluated → idempotent capture
+```
+
+- The operation is **tracked before** the external authorize call, so a
+  revocation/expiry landing mid-authorize still voids the hold.
+- Capture admission rechecks revocation + expiry immediately before money moves.
+- Escrow states: `HELD → EVIDENCE → RELEASED/CAPTURED`, plus
+  `UNKNOWN` (capture timed out — reconcile later) and
+  `CLEANUP_PENDING` (void failed — retry via `retry_cleanup()`, never
+  silently release the reservation).
+
+## Service topology
+
+`server.py` is the whole backend (Flask). The dashboard is served from
+`dashboard/`. The agent (`agent/`) is a demo spender, not infrastructure —
+it operates strictly inside its permit via `agent/tools.py`.
+
+## Money rules in code
+
+- All amounts in **integer cents**. No floats anywhere near money.
+- `remaining = cap − reserved − captured`, recomputed from the ledger,
+  never cached across a money-moving call.
+- `PayPal-Request-Id: {permit_id}:{auth_id}:capture` on every capture.

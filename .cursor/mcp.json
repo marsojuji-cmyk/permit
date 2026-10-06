@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "context7": {
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
+      "command": "npx",
+      "description": "Up-to-date library documentation lookup. Use when touching PayPal REST API details, Flask, or any dependency whose docs may have changed."
+    },
+    "paypal-sandbox": {
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.sandbox.paypal.com/http"
+      ],
+      "command": "npx",
+      "description": "PayPal's official MCP server (sandbox). OAuth login in the browser on first connect \u2014 no secrets stored here. Tools for orders, payments, invoices against the sandbox."
+    }
+  }
+}
