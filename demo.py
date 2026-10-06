@@ -32,6 +32,56 @@ from settlement.paypal_client import MockPayPalClient
 from settlement.verifier import Evidence, PredicateType, ReleaseVerifier, sign_acceptance
 
 
+def _dollars(cents) -> str:
+    """Format integer cents as a dollar string ($30, or $30.50 when not round)."""
+    try:
+        cents = int(cents)
+    except (TypeError, ValueError):
+        return "$?"
+    return f"${cents // 100}" if cents % 100 == 0 else f"${cents / 100:.2f}"
+
+
+# One plain-English line per receipt event type, so a first-time reader knows
+# what just happened. Payload fields are interpolated when present.
+EXPLANATIONS = {
+    "GRANTED": lambda p: (
+        f"A spending permit was issued: {_dollars(p.get('cap_cents'))} cap for "
+        f"{p.get('agent_id', 'the agent')}, allowlist {p.get('allowlist', [])}."
+    ),
+    "ALLOWED": lambda p: (
+        f"Agent tried to spend {_dollars(p.get('amount_cents'))} at "
+        f"{p.get('merchant_id', 'the merchant')}; all four permit clauses passed "
+        f"({_dollars(p.get('remaining_cents'))} left)."
+    ),
+    "AUTHORIZED": lambda p: (
+        f"Money for the {_dollars(p.get('amount_cents'))} spend was held on the "
+        "permit (not yet captured); PayPal authorization created."
+    ),
+    "CAPTURED": lambda p: f"Payment captured: {_dollars(p.get('amount_cents'))} moved.",
+    "BLOCKED": lambda p: (
+        f"Spend blocked ({p.get('reason', 'not authorized')}): "
+        f"{_dollars(p.get('remaining_cents'))} left, requested "
+        f"{_dollars(p.get('amount_cents'))}."
+    ),
+    "E-STOP": lambda p: (
+        "E-stop revoked the permit and voided its in-flight authorization "
+        f"({_dollars(p.get('reserved_cents_released'))} released)."
+    ),
+    "VOIDED": lambda p: "A held authorization was voided; no money moved.",
+}
+
+
+def _format_explanation(event_type: str, payload: dict) -> str:
+    """Format a one-line plain-English explanation for the event type."""
+    tmpl_func = EXPLANATIONS.get(event_type)
+    if not tmpl_func:
+        return f"No explanation for {event_type}."
+    try:
+        return tmpl_func(payload)
+    except Exception:
+        return f"No explanation for {event_type}."
+
+
 def show(receipts, prefix=""):
     for r in receipts:
         p = r.payload
@@ -45,6 +95,7 @@ def show(receipts, prefix=""):
         else:
             detail = p.get("reason", p.get("permit_id", ""))
         print(f"{prefix}#{r.seq:02d} {r.event_type:10s} {detail}")
+        print(f"{prefix}     -> {_format_explanation(r.event_type, p)}")
 
 
 def build_pipeline():
