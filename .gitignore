@@ -9,3 +9,4 @@ demo_transcript.jsonl
 # editor/agent config and internal scoring notes (kept out of the public tree)
 .cursor/
 CLIMB-SCORE.md
+runs/
