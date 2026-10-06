@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import socket
 import subprocess
 import sys
 import time
@@ -31,7 +32,16 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-PORT = 8741
+def _free_port():
+    """An ephemeral loopback port. trace.py must never assume the default
+    8741 is free: a live server there would answer the readiness probe and
+    the trace would run against (and pollute) the wrong server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port()
 BASE = f"http://127.0.0.1:{PORT}"
 
 
@@ -53,8 +63,14 @@ def main():
         cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
-        # wait for the listener
+        # wait for the listener; also verify the child is still alive so a
+        # bind failure can never be mistaken for a foreign server answering
+        # the probe.
         for _ in range(50):
+            if srv.poll() is not None:
+                raise SystemExit(
+                    f"server died on startup (exit {srv.returncode}); "
+                    "not probing the port further")
             try:
                 req("GET", "/api/ledger")
                 break
