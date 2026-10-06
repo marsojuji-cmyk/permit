@@ -92,7 +92,7 @@ The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`)
 ## Which evidence is which
 
 - `demo_six_beat.py` — **mock rail**: deterministic, no network, no credentials. The recorded camera run.
-- `spike.py` / `spike-report.md` — **separately recorded sandbox evidence** (Oct 2 spike): real REST calls, order/authorize/capture/void against PayPal sandbox, merchant identity verified.
+- Oct 2 sandbox spike — **API observations, not a repo artifact**: real REST calls (order/authorize/capture/void against PayPal sandbox, merchant identity verified). The spike scripts were removed from the tree; the facts live in `docs/sandbox-runbook.md`, labeled as API observations.
 - `docs/sandbox-runbook.md` — the **scripted procedure** for an integrated six-beat sandbox run (needs credentials + interactive approval). The integrated sandbox run is a procedure to execute, not a recorded artifact yet.
 
 ## Production boundaries (stated plainly)
