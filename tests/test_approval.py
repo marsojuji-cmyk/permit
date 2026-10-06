@@ -158,6 +158,21 @@ def test_approval_fails_closed_when_budget_moved():
     assert store.get_approval(a.approval_id).status == "approved"
 
 
+def test_approval_fails_closed_when_parent_revoked():
+    store, ledger, permit = make_store(cap=10000, threshold=2500)
+    flow, paypal = make_flow(store, ledger)
+    a = flow.spend(permit.permit_id, 4000, "m1", PredicateType.D, ah())
+    flow.approve_approval(a.approval_id)
+    # Revoke the permit (parent) before completion.
+    store.revoke(permit.permit_id)
+    before = len(paypal.authorize_calls)
+    c = flow.complete_approved_spend(a.approval_id)
+    assert not c.allowed
+    assert len(paypal.authorize_calls) == before
+    # Approval must NOT be consumed; only the authority recheck failed.
+    assert store.get_approval(a.approval_id).status == "approved"
+
+
 def test_expired_approval_cannot_be_decided_or_completed():
     store, ledger, permit = make_store()
     flow, paypal = make_flow(store, ledger)
