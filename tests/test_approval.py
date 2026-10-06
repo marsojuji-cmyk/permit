@@ -164,7 +164,7 @@ def test_approval_fails_closed_when_parent_revoked():
     a = flow.spend(permit.permit_id, 4000, "m1", PredicateType.D, ah())
     flow.approve_approval(a.approval_id)
     # Revoke the permit (parent) before completion.
-    store.revoke(permit.permit_id)
+    flow.estop(permit.permit_id)
     before = len(paypal.authorize_calls)
     c = flow.complete_approved_spend(a.approval_id)
     assert not c.allowed
