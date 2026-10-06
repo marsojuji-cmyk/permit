@@ -1,9 +1,15 @@
 """
-Permit six-beat demo (mock mode: no credentials, no network).
+Permit six-beat demo (mock PayPal rail: no PayPal credentials, no PayPal network).
 
 The human principal grants the permit; a REAL LLM agent (Grok, ReAct loop)
-decides what to spend. The dashboard (http://127.0.0.1:8471) shows live
-state: remaining budget, in-flight escrows, the receipt chain, e-stop.
+decides what to spend — the agent's reasoning needs the Grok CLI (network
++ credential) unless --replay is given. The fully offline, deterministic
+camera path is --replay demo_transcript.jsonl: the recorded reasoning is
+replayed verbatim and the recorded actions are re-executed against the
+live tools, so every receipt in the replay is real.
+
+The dashboard (http://127.0.0.1:8471) shows live state: remaining budget,
+in-flight escrows, the receipt chain, e-stop.
 
 Beats:
   1. Human grants a $50 permit: one merchant, one hour.
@@ -104,7 +110,15 @@ def main():
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
     dash = Dashboard(permits, ledger, flow, verifier, port=args.port).start()
     print(f"dashboard: http://127.0.0.1:{args.port}")
-    transcript = "demo_transcript.jsonl"
+    # The replay input is sacred: --replay must never truncate the file it
+    # is about to read. A live run records a fresh transcript; a replay
+    # writes its fresh log to a sibling file.
+    if args.replay:
+        stem = args.replay.rsplit(".", 1)
+        transcript = (stem[0] + ".replay.jsonl"
+                      if len(stem) > 1 else args.replay + ".replay.jsonl")
+    else:
+        transcript = "demo_transcript.jsonl"
     open(transcript, "w").close()  # fresh transcript per run
 
     # -- beat 1: the human grants -----------------------------------------

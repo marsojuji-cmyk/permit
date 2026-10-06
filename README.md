@@ -91,7 +91,7 @@ The service exposes the core verbs as JSON: issue a permit (`POST /api/permits`)
 
 ## Which evidence is which
 
-- `demo_six_beat.py` — **mock rail**: deterministic, no network, no credentials. The recorded camera run.
+- `demo_six_beat.py` — **mock rail**: no PayPal network, no PayPal credentials. The agent's reasoning is live (Grok CLI) by default; `--replay demo_transcript.jsonl` is the fully offline, deterministic recorded camera run — the recorded reasoning is replayed verbatim and the recorded actions are re-executed against the live tools, so every receipt in the replay is real.
 - `spike.py` / `spike-report.md` — **separately recorded sandbox evidence** (Oct 2 spike): real REST calls, order/authorize/capture/void against PayPal sandbox, merchant identity verified.
 - `docs/sandbox-runbook.md` — the **scripted procedure** for an integrated six-beat sandbox run (needs credentials + interactive approval). The integrated sandbox run is a procedure to execute, not a recorded artifact yet.
 

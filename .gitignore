@@ -4,4 +4,5 @@ __pycache__/
 .env
 *.egg-info/
 demo_transcript.jsonl
+demo_transcript.replay.jsonl
 .env.sandbox
