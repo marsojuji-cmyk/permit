@@ -6,10 +6,9 @@ The mock adapter implements the same interface with the same receipt
 shapes, so the full demo runs without sandbox credentials — judges and
 "run it" verification use mock mode; the recorded video uses sandbox mode.
 
-The real sandbox client (settlement/sandbox_client.py, spike-verified
-2026-10-02) implements this same interface against PayPal's REST API
-(Orders API, AUTHORIZE intent). The verifier never knows which one it
-holds.
+The real sandbox client (built during the Oct 6–8 spike) implements this
+same interface against PayPal's REST API. The verifier never knows which
+one it holds.
 
 Failure semantics (P1 settlement fixes, 2026-10-02):
   - PayPalTimeout: raised on any network timeout. A timed-out call has

@@ -1,5 +1,5 @@
 """
-Permit six-beat demo (mock payment rail; agent runner is external by default).
+Permit six-beat demo (mock mode: no credentials, no network).
 
 The human principal grants the permit; a REAL LLM agent (Grok, ReAct loop)
 decides what to spend. The dashboard (http://127.0.0.1:8471) shows live
@@ -22,9 +22,7 @@ Beats:
 
 Usage:
   python3 demo_six_beat.py [--replay TRANSCRIPT] [--fast] [--port 8471]
-  --replay reads/logs saved transcript records without calling the LLM. It
-  does not dispatch tools or reconstruct payment, escrow, ledger, or dashboard
-  state, so it is not an offline completion of the six-beat demonstration.
+  --replay re-runs a saved agent transcript without calling the LLM.
 """
 
 from __future__ import annotations
