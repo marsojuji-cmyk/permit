@@ -174,3 +174,13 @@ def test_replay_reexecutes_actions_with_id_remap(tmp_path):
                      if o.get("type") == "observation"
                      and "released" in o["text"])
     assert json.loads(fresh_obs["text"])["released"] is True
+
+
+def test_llm_preflight_fails_with_guidance_when_cli_unset(monkeypatch):
+    """No built-in default path: an unset PERMIT_GROK_CLI fails fast with guidance."""
+    monkeypatch.delenv("PERMIT_GROK_CLI", raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        llm_preflight()
+    msg = str(exc.value)
+    assert "PERMIT_GROK_CLI" in msg
+    assert "--replay" in msg
