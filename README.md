@@ -73,7 +73,7 @@ Each PayPal order needs interactive payer approval:
 - **PayPal sandbox** as the payment rail. Permit-authorized captures execute as genuine sandbox transactions; blocked attempts never reach PayPal at all.
 - **Claim ledger**: an in-memory SHA-256 hash chain (append-only; chain verification before every capture). It is **not** signed and it is **not** durable — those are stated boundaries, not features.
 - **Interlock** ([marsojuji-cmyk/interlock](https://github.com/marsojuji-cmyk/interlock), open-source, MIT) is the conceptual origin of the leased-authority model. The ledger dependency was removed; this repo's ledger is standalone.
-- An **AI agent** spender operating strictly inside its permit. It can reason, plan, and attempt purchases, but the authority check sits between intent and money. The runner CLI path is configurable via `PERMIT_GROK_CLI` (the demo default points at the author's workspace Grok runner); `--replay` re-runs a saved transcript with no LLM at all.
+- An **AI agent** spender operating strictly inside its permit. It can reason, plan, and attempt purchases, but the authority check sits between intent and money. The runner CLI path is set with the `PERMIT_GROK_CLI` environment variable (no default; the live demo stops with setup guidance if it is unset); `--replay` re-runs a saved transcript with no LLM at all.
 
 ## Run it
 

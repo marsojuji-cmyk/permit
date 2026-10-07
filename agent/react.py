@@ -22,13 +22,11 @@ import re
 import subprocess
 import sys
 
-# Path to the LLM runner CLI. Configurable via PERMIT_GROK_CLI so the repo
-# carries no hardcoded local paths; the default is the author's workspace.
-# Resolved at call time by _grok_cli(); this constant keeps the documented
-# default importable.
-GROK_CLI = os.environ.get(
-    "PERMIT_GROK_CLI", "/home/hatch/workspace/skills/grok/bin/grok.py"
-)
+# Path to the LLM runner CLI, set via the PERMIT_GROK_CLI environment
+# variable. There is no built-in default, so the repo carries no local paths.
+# Resolved at call time by _grok_cli(); this constant mirrors the value seen
+# at import time ("" when unset).
+GROK_CLI = os.environ.get("PERMIT_GROK_CLI", "")
 
 SYSTEM_TEMPLATE = """You are a shopping agent with a spending permit. You can spend ONLY \
 through your tools - you have no other way to move money.
@@ -109,10 +107,18 @@ def parse_action(text: str):
 
 
 def _grok_cli() -> str:
-    """Resolve the Grok runner path, honoring PERMIT_GROK_CLI at call time."""
-    return os.environ.get(
-        "PERMIT_GROK_CLI", "/home/hatch/workspace/skills/grok/bin/grok.py"
-    )
+    """Resolve the Grok runner path from PERMIT_GROK_CLI at call time.
+
+    Raises RuntimeError with setup guidance when the variable is unset.
+    """
+    cli = os.environ.get("PERMIT_GROK_CLI", "").strip()
+    if not cli:
+        raise RuntimeError(
+            "agent LLM backend not configured: PERMIT_GROK_CLI is not set. "
+            "Set PERMIT_GROK_CLI to the path of your Grok runner script, or run "
+            "the demo with --replay <transcript> (fully offline)."
+        )
+    return cli
 
 
 def llm_preflight() -> None:
