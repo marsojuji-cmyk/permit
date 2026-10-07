@@ -36,10 +36,15 @@ class Dashboard:
         permits = []
         if self.permits:
             for p in self.permits._permits.values():
+                eff_cap = p.cap_cents
+                if (p.tighten_cap_cents is not None
+                        and p.tighten_cap_cents < eff_cap):
+                    eff_cap = p.tighten_cap_cents
                 permits.append({
                     "permit_id": p.permit_id,
                     "agent_id": p.agent_id,
                     "cap_cents": p.cap_cents,
+                    "effective_cap_cents": eff_cap,
                     "reserved_cents": p.reserved_cents,
                     "captured_cents": p.captured_cents,
                     "remaining_cents": p.remaining_cents(),
@@ -110,6 +115,26 @@ class Dashboard:
         return {"ok": True, "approval_id": approval_id,
                 "decision": "approved" if approved else "denied"}
 
+    def revoke_cascade(self, permit_id: str) -> dict:
+        """Revoke a permit and its whole subtree (revocation wins the race)."""
+        if not self.flow:
+            return {"ok": False, "error": "no flow bound"}
+        receipt, voided = self.flow.revoke_cascade(permit_id)
+        return {"ok": True, "receipt_seq": receipt.seq, "voided": voided}
+
+    def tighten(self, permit_id: str, cap_cents: int) -> dict:
+        """Narrow a permit's cap post-issuance (authority only ever narrows)."""
+        if not self.permits:
+            return {"ok": False, "error": "no store bound"}
+        if not isinstance(cap_cents, int) or cap_cents <= 0:
+            return {"ok": False, "error": "cap_cents must be a positive integer"}
+        try:
+            permit, receipt = self.permits.tighten(permit_id, cap_cents=cap_cents)
+        except Exception as e:  # UnknownPermit, ValueError
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "permit_id": permit.permit_id,
+                "receipt_seq": receipt.seq}
+
     # -- http ---------------------------------------------------------------
 
     def _handler(self):
@@ -142,6 +167,17 @@ class Dashboard:
                     body = json.loads(self.rfile.read(length) or b"{}")
                     self._send(200, json.dumps(
                         dash.estop(body.get("permit_id", ""))))
+                elif self.path == "/api/revoke-cascade":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    self._send(200, json.dumps(
+                        dash.revoke_cascade(body.get("permit_id", ""))))
+                elif self.path == "/api/tighten":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    self._send(200, json.dumps(
+                        dash.tighten(body.get("permit_id", ""),
+                                     body.get("cap_cents", 0))))
                 elif self.path.startswith("/api/approvals/"):
                     # /api/approvals/<id>/approve | /deny
                     parts = self.path.split("/")

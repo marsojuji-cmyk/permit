@@ -67,6 +67,22 @@
   .detail { color:var(--dim); }
   .empty { color:var(--dim); font-style:italic; padding:12px 0; }
   #err { color:var(--red); font-size:12px; margin-bottom:12px; display:none; }
+  .node { border-left:2px solid var(--line); margin:4px 0 4px 8px;
+          padding:8px 0 8px 12px; }
+  .node.root { border-left-color:var(--blue); }
+  .node.revoked { border-left-color:var(--red); opacity:.78; }
+  .nodehead { display:flex; justify-content:space-between; align-items:baseline;
+              gap:8px; font-size:12px; flex-wrap:wrap; }
+  .carve { color:var(--amber); font-size:11px; margin:2px 0 4px; }
+  .carve.released { color:var(--green); }
+  .controls { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
+  .ctl { font-size:10px; font-weight:600; letter-spacing:.5px; padding:4px 10px;
+         border-radius:4px; border:1px solid var(--line); background:transparent;
+         color:var(--dim); cursor:pointer; }
+  .ctl:hover { border-color:var(--dim); color:var(--txt); }
+  .ctl.danger { border-color:var(--red); color:var(--red); }
+  .ctl.danger:hover { background:var(--red); color:#fff; }
+  .ctl:disabled { opacity:.35; cursor:default; }
 </style>
 </head>
 <body>
@@ -78,6 +94,7 @@
 <div class="grid">
   <div>
     <div class="card"><h2>Permits</h2><div id="permits"></div></div>
+    <div class="card"><h2>Delegation graph</h2><div id="graph"></div></div>
     <div class="card"><h2>Pending approvals</h2><div id="approvals"></div></div>
     <div class="card"><h2>In-flight escrows</h2><div id="escrows"></div></div>
   </div>
@@ -101,7 +118,7 @@ function receiptDetail(r){
     case "VOIDED": return `escrow ${esc((p.escrow_id||"").slice(0,12))}…`;
     case "REVOKED": return `permit ${esc((p.permit_id||"").slice(0,12))}…`;
     case "E-STOP": return `permit ${esc((p.permit_id||"").slice(0,12))}… revoked`;
-    case "DELEGATED": return `cap ${cents(p.cap_cents)} · child of ${esc((p.parent_id||"").slice(0,12))}… · ${esc(p.agent_id||"")}`;
+    case "DELEGATED": return `cap ${cents(p.cap_cents)} · ${esc(p.agent_id||"")} · parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
     case "REVOKED_CASCADE": return `cascade from ${esc((p.parent_id||"").slice(0,12))}… · revoked ${esc((p.permit_id||"").slice(0,12))}…`;
     case "CARVE_RELEASED": return `${cents(p.released_cents||0)} back to parent ${esc((p.parent_permit_id||"").slice(0,12))}…`;
     case "APPROVAL_REQUESTED": return `${cents(p.amount_cents)} · ${esc(p.merchant_id||"")} · needs principal`;
@@ -126,6 +143,87 @@ async function estop(pid){
   const j = await res.json();
   if(!j.ok) alert("e-stop failed: "+(j.error||"unknown"));
   refresh();
+}
+
+async function revokeTree(pid){
+  if(!confirm("Revoke this permit AND every descendant sub-permit (revocation wins the race)?")) return;
+  const res = await fetch("/api/revoke-cascade",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({permit_id:pid})});
+  const j = await res.json();
+  if(!j.ok) alert("revoke-cascade failed: "+(j.error||"unknown"));
+  refresh();
+}
+
+async function tightenPermit(pid, capCents){
+  const v = prompt(`Tighten cap for ${pid} (current cap ${cents(capCents)}).\nNew cap must be lower — authority only ever narrows:`, "");
+  if(v === null) return;
+  const nc = Math.round(Number(v.replace(/[^0-9.]/g,"")) * 100);
+  if(!nc || nc <= 0){ alert("enter a positive amount"); return; }
+  const res = await fetch("/api/tighten",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({permit_id:pid, cap_cents:nc})});
+  const j = await res.json();
+  if(!j.ok) alert("tighten failed: "+(j.error||"unknown"));
+  refresh();
+}
+
+function renderGraph(s){
+  // Carve and release ledger facts join permits into a delegation tree.
+  // Cascaded children lose their parent_id when the carve is released, so
+  // REVOKED_CASCADE receipts re-attach them under their revoked parent for
+  // the demo view ("revoked subtrees render distinctly").
+  const byId = {}; s.permits.forEach(p => byId[p.permit_id] = p);
+  const carve = {}, released = {}, cascadeParent = {};
+  s.receipts.forEach(r => {
+    const p = r.payload || {};
+    if(r.event === "DELEGATED") carve[p.child_permit_id] = p.cap_cents;
+    if(r.event === "CARVE_RELEASED") released[p.child_permit_id] = p.released_cents;
+    if(r.event === "REVOKED_CASCADE") cascadeParent[p.permit_id] = p.parent_id;
+  });
+  const kids = {}, via = {};
+  s.permits.forEach(p => {
+    let parent = p.parent_id, how = "live";
+    if(!parent && p.revoked && cascadeParent[p.permit_id] && byId[cascadeParent[p.permit_id]]){
+      parent = cascadeParent[p.permit_id]; how = "cascade";
+    }
+    if(parent){ (kids[parent] = kids[parent] || []).push(p.permit_id); via[p.permit_id] = how; }
+  });
+  const hasParent = new Set(Object.keys(via));
+  const roots = s.permits.filter(p => !hasParent.has(p.permit_id));
+
+  function edgeLabel(id){
+    if(carve[id] == null) return "";
+    if(released[id] != null)
+      return `<div class="carve released">carve ${cents(carve[id])} released${via[id]==="cascade"?" by cascade":""} back to parent</div>`;
+    return `<div class="carve">carved ${cents(carve[id])} from parent · still held</div>`;
+  }
+  function node(p, depth){
+    const dis = p.revoked ? "disabled" : "";
+    const status = p.revoked
+      ? (via[p.permit_id]==="cascade" ? "REVOKED · cascade" : "REVOKED")
+      : "active";
+    const capLine = (p.effective_cap_cents != null && p.effective_cap_cents < p.cap_cents)
+      ? `<span style="color:var(--dim)">remaining of ${cents(p.effective_cap_cents)} (tightened from ${cents(p.cap_cents)})</span>`
+      : `<span style="color:var(--dim)">remaining of ${cents(p.cap_cents)}</span>`;
+    let h = `<div class="node${depth===0?" root":""}${p.revoked?" revoked":""}">`;
+    h += edgeLabel(p.permit_id);
+    h += `<div class="nodehead"><span><b>${esc(p.agent_id)}</b>
+      <span class="mono" style="color:var(--dim)">${esc(p.permit_id.slice(0,14))}…</span></span>
+      <span><b>${cents(p.remaining_cents)}</b> ${capLine}</span></div>`;
+    h += `<div class="kv"><span>reserved</span><b>${cents(p.reserved_cents)}</b></div>
+          <div class="kv"><span>captured</span><b>${cents(p.captured_cents)}</b></div>
+          <div class="kv"><span>status</span><b>${status}</b></div>`;
+    h += `<div class="controls">
+      <button class="ctl danger" ${dis} onclick="revokeTree('${esc(p.permit_id)}')">REVOKE TREE</button>
+      <button class="ctl" ${dis} onclick="tightenPermit('${esc(p.permit_id)}',${p.effective_cap_cents||p.cap_cents})">TIGHTEN</button>
+    </div>`;
+    (kids[p.permit_id]||[]).forEach(cid => { h += node(byId[cid], depth+1); });
+    return h + `</div>`;
+  }
+  return roots.length
+    ? roots.map(p => node(p, 0)).join("")
+    : `<div class="empty">no permits yet</div>`;
 }
 
 async function refresh(){
@@ -158,6 +256,8 @@ async function refresh(){
         ${cents(e.amount_cents)}</span>
         <span class="st ${e.state}">${e.state}</span></div>`
     ).join("") : `<div class="empty">no escrows in flight</div>`;
+
+    $("graph").innerHTML = renderGraph(s);
 
     $("approvals").innerHTML = (s.approvals||[]).length ? s.approvals.map(a=>
       `<div class="escrow"><span>${cents(a.amount_cents)} · ${esc(a.merchant_id)}<br>

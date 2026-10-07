@@ -1,16 +1,14 @@
 # Permit
 
-**Payment authority for AI agents.**
-No spend without a permit. No timeout without a receipt.
-Permit puts enforceable spending permissions between an AI agent and PayPal: a budget, approved merchants, an expiry, and revocation — with a receipt for each decision.
+**Payment authority for AI agents.** Permit puts enforceable spending permissions between an AI agent and PayPal: a budget, approved merchants, an expiry, and revocation — with a receipt for each decision.
 
 Built for the [PayPal AI Hackathon](https://paypalaihackathon.devpost.com/) (Nov 12, 2026).
 
-## The threat
+## The problem
 
 AI agents are about to get wallets. Every major lab is building toward it. What is not yet built, anywhere we can find, is the authority layer: the thing that decides what an agent is *allowed* to spend, on whose terms, with what record. This prototype is one concrete answer to that gap — scoped, testable, and honest about its boundaries (see below).
 
-## The defense
+## What it does
 
 No agent touches raw account access, ever. Each agent spends on a **permit**: an amount cap, a merchant allowlist, an expiry. Every attempt, allowed or blocked, is written to a tamper-evident **claim ledger**. The **e-stop** revokes a permit mid-spend and voids every in-flight authorization it can reach.
 
