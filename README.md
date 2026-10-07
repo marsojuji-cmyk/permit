@@ -42,14 +42,15 @@ python demo.py             # end-to-end mock demo, ends with the ledger chain ch
 More demos:
 
 ```bash
-python demo_six_beat.py          # grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
-python demo_delegation.py --fast # two LLM agents, five beats, live dashboard
-python demo_approval.py --fast   # auto-allow, approve, deny, fail-closed
+python demo_sla_escrow.py        # offline: agent-to-agent SLA escrow, acceptance-signed capture, forged signature refused
 python server.py                 # the service at http://127.0.0.1:8741
-python trace.py                  # drives the live server through allow, block, delegate, cascade revoke, chain check
+python trace.py                  # with server.py running: allow, block, delegate, cascade revoke, chain check
+python demo_six_beat.py          # LLM agent: grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
+python demo_delegation.py --fast # LLM agents: buyer and researcher, five beats, live dashboard
+python demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, fail-closed
 ```
 
-The live agent demos call an LLM runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo stops with setup guidance. `--replay demo_transcript.jsonl` re-runs a recorded transcript fully offline, re-executing every recorded action against the live tools.
+The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl`. The file is gitignored, so a fresh clone has no transcript until you record one.
 
 ## How it fails
 
@@ -89,7 +90,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 4. `POST /api/escrows/<id>/release` with delivery evidence: predicate check, then capture.
 5. `POST /api/escrows/<id>/reconcile` or `/retry-cleanup`: the recovery paths above.
 
-**Service verbs (JSON):** issue (`POST /api/permits`), delegate (`POST /api/permits/<id>/delegate`), check (read-only: no reservation, no receipt), spend, resume, release, reconcile, retry cleanup, e-stop, revoke a subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default. `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET`).
+**Service verbs (JSON):** issue (`POST /api/permits`), delegate (`POST /api/permits/<id>/delegate`), tighten (`POST /api/permits/<id>/tighten`: narrows cap, merchants, expiry, or approval threshold, never widens), check (read-only: no reservation, no receipt), spend, resume, release, reconcile, retry cleanup, e-stop, revoke a subtree (`POST /api/permits/<id>/revoke-cascade`), and read the ledger (`GET /api/ledger`). Mock mode is the default. `--sandbox` arms the real PayPal sandbox rail (needs `PERMIT_PAYPAL_CLIENT_ID` / `PERMIT_PAYPAL_CLIENT_SECRET`).
 
 **Actors:** the **payer** approves, the **merchant** delivers, the **Permit operator** issues permits and holds the e-stop, and the **credential owner** holds the PayPal secret. The agent never holds credentials.
 
@@ -97,10 +98,10 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **170 tests pass:** `python -m pytest -q`, run 2026-10-07 on `main`. CI runs the same suite plus `python demo.py` on every push.
-- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07).
+- **170 tests pass:** `python -m pytest -q`, run 2026-10-07 on `main` at `dc0f3a5`. CI runs the same suite plus `python demo.py` on every push.
+- **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
 - **Mock rail vs sandbox, kept separate:**
-  - `demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials.
+  - `demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
   - The Oct 2 sandbox spike made real REST calls (OAuth, order, authorize, capture, void) against PayPal sandbox and verified merchant identity. Its report left the tree in `3f88feb`. Read it with `git show 3f88feb^:spike-report.md`.
   - `docs/sandbox-runbook.md` is the scripted procedure for an integrated six-beat sandbox run. That run is not yet recorded.
 
