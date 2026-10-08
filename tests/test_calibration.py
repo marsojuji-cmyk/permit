@@ -335,3 +335,186 @@ def test_tau_change_never_changes_authority_decision():
     assert r.allowed and r.reason == "allowed"
     r = store.check(p.permit_id, 500, "evil")
     assert not r.allowed and r.reason == "merchant_not_allowed"
+
+
+# -- ADVISORY ONLY: recorded on receipts, never changes authority -------------
+
+import hashlib  # noqa: E402
+import inspect  # noqa: E402
+
+import permit.permit as permit_module  # noqa: E402
+from permit.flow import SpendPipeline  # noqa: E402
+from settlement.paypal_client import MockPayPalClient  # noqa: E402
+from settlement.verifier import Evidence, PredicateType, ReleaseVerifier  # noqa: E402
+
+# Every reason check() could return at 39a7a0c. Calibration adds none.
+KNOWN_CHECK_REASONS = {
+    "allowed", "invalid_amount", "unknown_permit", "revoked", "expired",
+    "tightened_expiry_passed", "merchant_not_allowed", "over_remaining_cap",
+    "tightened_cap_exceeded", "ancestor_revoked", "ancestor_expired",
+    "ancestor_missing",
+}
+
+
+def _scenarios(store):
+    """Run a fixed battery of attempts; return each authority outcome."""
+    now = datetime.now(timezone.utc)
+    later = now + timedelta(hours=24)
+    out = []
+
+    def grant(**kw):
+        kw.setdefault("allowlist", ["m1", "m2"])
+        kw.setdefault("expiry", later)
+        return store.grant("agent-1", kw.pop("cap", 10_000), **kw)[0]
+
+    def attempt(pid, amount, merchant):
+        r = store.check(pid, amount, merchant)
+        p = store.get(pid)
+        out.append((r.allowed, r.reason,
+                    None if p is None else (p.reserved_cents, p.remaining_cents()),
+                    None if r.receipt is None else r.receipt.event_type))
+        return r
+
+    ok = grant()
+    attempt(ok.permit_id, 500, "m1")                      # allowed
+    attempt(ok.permit_id, 9_500, "m2")                    # allowed, cap exhausted
+    attempt(ok.permit_id, 1, "m1")                        # over_remaining_cap
+    attempt(ok.permit_id, 100, "evil")                    # merchant_not_allowed
+    attempt(ok.permit_id, 0, "m1")                        # invalid_amount
+    attempt("prm_missing", 100, "m1")                     # unknown_permit
+    exp = grant(expiry=now - timedelta(seconds=1))
+    attempt(exp.permit_id, 100, "m1")                     # expired
+    rev = grant()
+    store.estop(rev.permit_id)
+    attempt(rev.permit_id, 100, "m1")                     # revoked
+    tig = grant()
+    store.tighten(tig.permit_id, cap_cents=1_000)
+    attempt(tig.permit_id, 2_000, "m1")                   # tightened_cap_exceeded
+    attempt(tig.permit_id, 900, "m1")                     # allowed under tighten
+    parent = grant()
+    child = store.delegate(parent.permit_id, "agent-2", 1_000, ["m1"], later).permit
+    attempt(child.permit_id, 100, "m1")                   # allowed via carve
+    store.estop(parent.permit_id)
+    attempt(child.permit_id, 100, "m1")                   # ancestor_revoked
+    return out
+
+
+def _tampered_store():
+    store = PermitStore(ledger=Ledger())
+    store.grant("seed", 100, ["m1"], datetime.now(timezone.utc) + timedelta(hours=1))
+    store.ledger.receipts()[0].payload["cap_cents"] = 999_999  # break the chain
+    assert store.ledger.verify_chain()[0] is False
+    return store
+
+
+def test_zero_score_spend_gets_identical_authority_decision(monkeypatch):
+    """S == 0 (empty ledger, tampered chain) vs S == 1 vs calibration
+    switched off: every authority outcome, reservation and receipt type is
+    identical. The score is recorded, never consulted."""
+    empty = _scenarios(PermitStore(ledger=Ledger()))   # n_receipts=0 -> S=0
+    tampered = _scenarios(_tampered_store())           # chain broken -> S=0
+
+    with monkeypatch.context() as m:
+        m.setattr(permit_module._calibration, "score", lambda *a, **k: 1.0)
+        forced_one = _scenarios(PermitStore(ledger=Ledger()))
+    with monkeypatch.context() as m:
+        m.setattr(PermitStore, "_advisory_calibration", lambda self, p, now: {})
+        without = _scenarios(PermitStore(ledger=Ledger()))
+
+    assert empty == tampered == forced_one == without
+    reasons = {o[1] for o in empty}
+    assert reasons <= KNOWN_CHECK_REASONS
+    assert {"allowed", "over_remaining_cap", "merchant_not_allowed",
+            "invalid_amount", "unknown_permit", "expired", "revoked",
+            "tightened_cap_exceeded", "ancestor_revoked"} <= reasons
+
+
+def test_zero_score_recorded_on_allowed_receipt_and_spend_still_allowed():
+    store = PermitStore(ledger=Ledger())
+    p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
+    r = store.check(p.permit_id, 500, "m1")
+    assert r.allowed and r.reason == "allowed"
+    cal = r.receipt.payload["calibration"]
+    assert cal["advisory"] is True
+    assert cal["S"] == 0.0 and cal["n_receipts"] == 0 and cal["chain_ok"] is True
+    assert cal["verdict"] == BELOW and cal["tau"] == TAU_DEFAULT
+    assert store.ledger.verify_chain() == (True, "ok")
+
+
+def test_tampered_chain_recorded_as_zero_score_without_new_block():
+    store = _tampered_store()
+    p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
+    r = store.check(p.permit_id, 500, "m1")
+    assert r.allowed and r.reason == "allowed"
+    cal = r.receipt.payload["calibration"]
+    assert cal["S"] == 0.0 and cal["chain_ok"] is False
+
+
+def test_blocked_receipt_carries_advisory_score_and_original_reason():
+    store = PermitStore(ledger=Ledger())
+    p, _ = store.grant("a", 1_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
+    r = store.check(p.permit_id, 5_000, "m1")
+    assert not r.allowed and r.reason == "over_remaining_cap"
+    blocked = [x for x in store.ledger.receipts() if x.event_type == "BLOCKED"]
+    assert blocked == [r.receipt]
+    assert blocked[0].payload["reason"] == "over_remaining_cap"
+    assert blocked[0].payload["calibration"]["advisory"] is True
+
+
+def test_calibration_failure_never_blocks_a_spend(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("calibration exploded")
+    monkeypatch.setattr(permit_module._calibration, "score", boom)
+    store = PermitStore(ledger=Ledger())
+    p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
+    r = store.check(p.permit_id, 500, "m1")
+    assert r.allowed and r.reason == "allowed"
+    assert r.receipt.payload["calibration"] == {
+        "advisory": True, "status": "unavailable", "error": "RuntimeError",
+    }
+    assert store.get(p.permit_id).reserved_cents == 500
+    assert store.ledger.verify_chain() == (True, "ok")
+
+
+def test_eligible_stays_read_only_with_calibration():
+    store = PermitStore(ledger=Ledger())
+    p, _ = store.grant("a", 10_000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=24))
+    before = len(store.ledger)
+    assert store.eligible(p.permit_id, 500, "m1").allowed
+    assert len(store.ledger) == before
+
+
+def test_authority_evaluation_never_reads_calibration():
+    for fn in (PermitStore._evaluate, PermitStore.eligible,
+               PermitStore._lineage_block_reason, PermitStore._effective):
+        src = inspect.getsource(fn)
+        for word in ("calibration", "tau", "score", "verdict"):
+            assert word not in src, f"{fn.__name__} references {word}"
+
+
+def test_score_counts_verified_captures_through_mock_pipeline():
+    """n_receipts = CAPTURED receipts on the permit (one per capture, via
+    the mock rail only). After N_MIN captures confidence reaches 1."""
+    ledger = Ledger()
+    store = PermitStore(ledger=ledger)
+    paypal = MockPayPalClient()
+    verifier = ReleaseVerifier(paypal, store, ledger=ledger)
+    flow = SpendPipeline(store, paypal, verifier, ledger=ledger)
+    merchant = "m1"
+    p, _ = store.grant("a", 1_000_000, [merchant],
+                       datetime.now(timezone.utc) + timedelta(hours=24))
+    artifact = b"deliverable"
+    digest = hashlib.sha256(artifact).hexdigest()
+    for _ in range(N_MIN):
+        a = flow.spend(p.permit_id, 100, merchant, PredicateType.D, digest)
+        assert a.allowed
+        assert flow.release(a.escrow_id, Evidence(delivered_bytes=artifact)).released
+    r = store.check(p.permit_id, 100, merchant)
+    cal = r.receipt.payload["calibration"]
+    assert cal["n_receipts"] == N_MIN and cal["chain_ok"] is True
+    assert 0.9 < cal["S"] <= 1.0 and cal["verdict"] == MEETS
+    allowed = [x for x in ledger.receipts() if x.event_type == "ALLOWED"]
+    scores = [x.payload["calibration"]["S"] for x in allowed]
+    assert scores[0] == 0.0
+    assert all(a <= b + 0.01 for a, b in zip(scores, scores[1:]))
+    assert ledger.verify_chain() == (True, "ok")

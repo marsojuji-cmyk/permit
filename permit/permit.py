@@ -52,6 +52,11 @@ The grant-time tau is the floor; raise_calibration_tau() may only raise
 it. A lowering, a no-op or an out-of-range value is refused with a
 TAU_REFUSED receipt and the stored tau is unchanged. Tau is NOT an
 authority clause: _evaluate() never reads it.
+
+check() records the advisory score on the ALLOWED/BLOCKED receipt it
+writes (payload key "calibration"), computed AFTER the authority decision
+is made. Any failure computing it is recorded as unavailable; it can
+never change, block or allow a spend.
 """
 
 from __future__ import annotations
@@ -61,6 +66,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from . import calibration as _calibration
 from .calibration import TAU_DEFAULT, validate_tau
 from .ledger import Ledger, Receipt
 
@@ -837,6 +843,57 @@ class PermitStore:
             return "tightened_cap_exceeded" if cap_tightened else "over_remaining_cap"
         return None
 
+    def _advisory_calibration(self, permit: Permit, now: datetime) -> dict:
+        """
+        ADVISORY calibration record for a receipt payload. Called by check()
+        only after the authority decision is final; the result is data on
+        the receipt, never an input to the decision. Caller holds
+        permit._lock. Never raises: a failure is recorded as unavailable.
+
+        n_receipts = CAPTURED receipts on this permit (verified captures);
+        chain_ok = the ledger's own verify_chain(). Fixture weights/scales.
+        """
+        try:
+            cap, _, allow, expiry, _ = self._effective(permit)
+            granted = set(permit.allowlist)
+            coverage = len(allow & granted) / len(granted) if granted else 0.0
+            x = _calibration.features(
+                permit.remaining_cents(),
+                permit.cap_cents,
+                (expiry - now).total_seconds() / 3600.0,
+                coverage,
+            )
+            n = sum(
+                1
+                for r in self.ledger.receipts()
+                if r.event_type == "CAPTURED"
+                and r.payload.get("permit_id") == permit.permit_id
+            )
+            chain_ok, _ = self.ledger.verify_chain()
+            S = _calibration.score(
+                x,
+                _calibration.FIXTURE_SPEC_X,
+                _calibration.FIXTURE_WEIGHTS,
+                _calibration.FIXTURE_SCALES,
+                n,
+                chain_ok,
+            )
+            tau = permit.calibration_tau
+            return {
+                "advisory": True,
+                "S": S,
+                "tau": tau,
+                "verdict": _calibration.advisory_verdict(S, tau),
+                "n_receipts": n,
+                "chain_ok": chain_ok,
+            }
+        except Exception as exc:  # advisory: must never affect the spend
+            return {
+                "advisory": True,
+                "status": "unavailable",
+                "error": type(exc).__name__,
+            }
+
     def eligible(
         self,
         permit_id: str,
@@ -929,6 +986,9 @@ class PermitStore:
                 # child -> ancestor order (cannot cycle: delegation depth
                 # strictly increases).
                 reason = self._lineage_block_reason(chain, now)
+            # The authority decision (reason) is final above. The advisory
+            # calibration score is recorded on the receipt and never read.
+            calibration = self._advisory_calibration(permit, now)
             if reason is not None:
                 receipt = self.ledger.append(
                     "BLOCKED",
@@ -939,6 +999,7 @@ class PermitStore:
                         "merchant_id": merchant_id,
                         "reason": reason,
                         "remaining_cents": permit.remaining_cents(),
+                        "calibration": calibration,
                     },
                 )
                 return CheckResult(False, reason, receipt)
@@ -956,6 +1017,7 @@ class PermitStore:
                     "merchant_id": merchant_id,
                     "auth_id": auth_id,
                     "remaining_cents": permit.remaining_cents(),
+                    "calibration": calibration,
                 },
             )
             return CheckResult(True, "allowed", receipt)
