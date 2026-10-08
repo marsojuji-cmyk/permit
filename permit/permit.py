@@ -45,6 +45,13 @@ subtree obeys the tightened mandate with no ancestor walk at check time.
 Every tighten writes a TIGHTEN receipt with old→new per narrowed clause;
 cascaded applications carry cascade_from. A tighten that would widen or
 leave authority unchanged is rejected.
+
+Calibration tau (Sol 6.1, ADVISORY): each permit carries the tau its
+advisory calibration score is compared against (permit/calibration.py).
+The grant-time tau is the floor; raise_calibration_tau() may only raise
+it. A lowering, a no-op or an out-of-range value is refused with a
+TAU_REFUSED receipt and the stored tau is unchanged. Tau is NOT an
+authority clause: _evaluate() never reads it.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from .calibration import TAU_DEFAULT, validate_tau
 from .ledger import Ledger, Receipt
 
 
@@ -96,6 +104,15 @@ class DelegateResult:
     reason: str
     permit: Permit | None = None
     receipt: Receipt | None = None
+
+
+@dataclass
+class TauResult:
+    """Outcome of raise_calibration_tau(). The receipt is always written."""
+    ok: bool
+    reason: str
+    tau: float | None
+    receipt: Receipt
 
 
 @dataclass
@@ -142,6 +159,9 @@ class Permit:
     # None = no threshold. Tighten-only via tighten().
     approval_threshold_cents: int | None = None
     tighten_approval_threshold_cents: int | None = None
+    # Advisory calibration tau (Sol 6.1). Raise-only after grant; never
+    # read by the authority check.
+    calibration_tau: float = TAU_DEFAULT
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def remaining_cents(self) -> int:
@@ -178,10 +198,12 @@ class PermitStore:
         allowlist: list[str],
         expiry: datetime,
         approval_threshold_cents: int | None = None,
+        calibration_tau: float = TAU_DEFAULT,
     ) -> tuple[Permit, Receipt]:
         _validate_amount(cap_cents)
         if approval_threshold_cents is not None:
             _validate_amount(approval_threshold_cents)
+        calibration_tau = validate_tau(calibration_tau)
         permit = Permit(
             permit_id=f"prm_{uuid.uuid4().hex[:12]}",
             agent_id=agent_id,
@@ -189,6 +211,7 @@ class PermitStore:
             allowlist=tuple(allowlist),
             expiry=expiry,
             approval_threshold_cents=approval_threshold_cents,
+            calibration_tau=calibration_tau,
         )
         with self._store_lock:
             self._permits[permit.permit_id] = permit
@@ -201,6 +224,7 @@ class PermitStore:
                 "allowlist": list(allowlist),
                 "expiry": expiry.isoformat(),
                 "approval_threshold_cents": approval_threshold_cents,
+                "calibration_tau": calibration_tau,
             },
         )
         return permit, receipt
@@ -306,6 +330,8 @@ class PermitStore:
                     expiry=expiry,
                     parent_id=parent.permit_id,
                     depth=parent.depth + 1,
+                    # Advisory tau: a carve starts at the parent's tau.
+                    calibration_tau=parent.calibration_tau,
                 )
                 self._permits[child.permit_id] = child
                 self._children.setdefault(parent.permit_id, []).append(
@@ -695,6 +721,74 @@ class PermitStore:
                 "every requested bound (tighten-only)"
             )
         return permit, first_receipt
+
+    def raise_calibration_tau(
+        self, permit_id: str, tau, actor: str = "human"
+    ) -> TauResult:
+        """
+        Raise the ADVISORY calibration tau on a live permit. Raise-only:
+        the grant-time tau is the floor. Refusals (lowering, no-op, out
+        of (0, 1], non-number, unknown/revoked/expired permit) write a
+        TAU_REFUSED receipt and leave the stored tau unchanged; success
+        writes TAU_RAISED with from/to. Never changes authority: tau is
+        not a clause of the 4-clause check.
+        """
+        now = datetime.now(timezone.utc)
+        actor = actor.strip() if isinstance(actor, str) and actor.strip() else "human"
+        try:
+            new_tau: float | None = validate_tau(tau)
+        except ValueError:
+            new_tau = None
+        # Out-of-range / non-number requests are recorded by repr (keeps
+        # NaN/inf out of the hashed JSON payload).
+        requested = new_tau if new_tau is not None else repr(tau)
+
+        def refuse(reason: str, current: float | None) -> TauResult:
+            receipt = self.ledger.append(
+                "TAU_REFUSED",
+                {
+                    "permit_id": permit_id,
+                    "actor": actor,
+                    "requested_tau": requested,
+                    "current_tau": current,
+                    "reason": reason,
+                },
+            )
+            return TauResult(False, reason, current, receipt)
+
+        permit = self.get(permit_id)
+        if permit is None:
+            return refuse("unknown_permit", None)
+        if new_tau is None:
+            with permit._lock:
+                current = permit.calibration_tau
+            return refuse("tau_out_of_range", current)
+        with permit._lock:
+            current = permit.calibration_tau
+            if permit.revoked:
+                reason = "revoked"
+            elif now >= self._effective(permit)[3]:
+                reason = "expired"
+            elif new_tau < current:
+                reason = "tau_lowering_refused"
+            elif new_tau == current:
+                reason = "tau_unchanged"
+            else:
+                reason = None
+            if reason is not None:
+                return refuse(reason, current)
+            permit.calibration_tau = new_tau
+            receipt = self.ledger.append(
+                "TAU_RAISED",
+                {
+                    "permit_id": permit.permit_id,
+                    "agent_id": permit.agent_id,
+                    "actor": actor,
+                    "from": current,
+                    "to": new_tau,
+                },
+            )
+            return TauResult(True, "raised", new_tau, receipt)
 
     @staticmethod
     def _effective(

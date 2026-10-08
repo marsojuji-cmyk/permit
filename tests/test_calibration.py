@@ -197,3 +197,141 @@ def test_calibration_module_imports_no_paypal_client():
     import permit.calibration as cal
     src = open(cal.__file__, encoding="utf-8").read()
     assert "settlement" not in src and "paypal_client" not in src
+
+
+# -- tighten-only tau on permits (raise-only; refusals receipted) -------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from permit.ledger import Ledger  # noqa: E402
+from permit.permit import PermitStore  # noqa: E402
+
+
+def _store_and_permit(**kw):
+    store = PermitStore(ledger=Ledger())
+    kw.setdefault("agent_id", "agent-1")
+    kw.setdefault("cap_cents", 10_000)
+    kw.setdefault("allowlist", ["m1", "m2"])
+    kw.setdefault("expiry", datetime.now(timezone.utc) + timedelta(hours=24))
+    permit, receipt = store.grant(**kw)
+    return store, permit, receipt
+
+
+def _events(store, event_type):
+    return [r for r in store.ledger.receipts() if r.event_type == event_type]
+
+
+def test_tau_lowering_is_refused_receipted_and_unchanged():
+    store, p, _ = _store_and_permit(calibration_tau=0.80)
+    before = len(store.ledger)
+    res = store.raise_calibration_tau(p.permit_id, 0.70)
+    assert not res.ok and res.reason == "tau_lowering_refused"
+    assert store.get(p.permit_id).calibration_tau == 0.80
+    assert len(store.ledger) == before + 1
+    refused = _events(store, "TAU_REFUSED")
+    assert len(refused) == 1 and refused[0] is res.receipt
+    assert refused[0].payload["reason"] == "tau_lowering_refused"
+    assert refused[0].payload["current_tau"] == 0.80
+    assert refused[0].payload["requested_tau"] == 0.70
+    assert _events(store, "TAU_RAISED") == []
+    assert store.ledger.verify_chain() == (True, "ok")
+
+
+def test_tau_below_grant_floor_refused_even_after_raises():
+    store, p, _ = _store_and_permit()
+    assert store.raise_calibration_tau(p.permit_id, 0.90).ok
+    res = store.raise_calibration_tau(p.permit_id, TAU_DEFAULT)
+    assert not res.ok and res.reason == "tau_lowering_refused"
+    assert store.get(p.permit_id).calibration_tau == 0.90
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -0.5, 1.01, 2, math.nan, math.inf, True, "0.9", None])
+def test_tau_out_of_range_refused_receipted_and_unchanged(bad):
+    store, p, _ = _store_and_permit()
+    res = store.raise_calibration_tau(p.permit_id, bad)
+    assert not res.ok and res.reason == "tau_out_of_range"
+    assert store.get(p.permit_id).calibration_tau == TAU_DEFAULT
+    refused = _events(store, "TAU_REFUSED")
+    assert len(refused) == 1
+    assert refused[0].payload["requested_tau"] == repr(bad)
+    assert store.ledger.verify_chain() == (True, "ok")
+
+
+def test_tau_noop_refused_receipted():
+    store, p, _ = _store_and_permit()
+    res = store.raise_calibration_tau(p.permit_id, TAU_DEFAULT)
+    assert not res.ok and res.reason == "tau_unchanged"
+    assert len(_events(store, "TAU_REFUSED")) == 1
+
+
+def test_tau_raise_accepted_and_receipted():
+    store, p, _ = _store_and_permit()
+    res = store.raise_calibration_tau(p.permit_id, 0.85, actor="marcus")
+    assert res.ok and res.reason == "raised" and res.tau == 0.85
+    assert store.get(p.permit_id).calibration_tau == 0.85
+    raised = _events(store, "TAU_RAISED")
+    assert len(raised) == 1 and raised[0] is res.receipt
+    assert raised[0].payload["from"] == TAU_DEFAULT
+    assert raised[0].payload["to"] == 0.85
+    assert raised[0].payload["actor"] == "marcus"
+    assert store.raise_calibration_tau(p.permit_id, 1).ok
+    assert store.get(p.permit_id).calibration_tau == 1.0
+    assert store.ledger.verify_chain() == (True, "ok")
+
+
+def test_tau_unknown_permit_refused_receipted():
+    store, _, _ = _store_and_permit()
+    res = store.raise_calibration_tau("prm_nope", 0.9)
+    assert not res.ok and res.reason == "unknown_permit"
+    assert _events(store, "TAU_REFUSED")[0].payload["permit_id"] == "prm_nope"
+
+
+def test_tau_raise_on_revoked_permit_refused():
+    store, p, _ = _store_and_permit()
+    store.estop(p.permit_id)
+    res = store.raise_calibration_tau(p.permit_id, 0.9)
+    assert not res.ok and res.reason == "revoked"
+    assert store.get(p.permit_id).calibration_tau == TAU_DEFAULT
+
+
+def test_tau_raise_on_expired_permit_refused():
+    store, p, _ = _store_and_permit(
+        expiry=datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
+    res = store.raise_calibration_tau(p.permit_id, 0.9)
+    assert not res.ok and res.reason == "expired"
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 1.5, math.nan, True])
+def test_grant_rejects_out_of_range_tau(bad):
+    store = PermitStore(ledger=Ledger())
+    with pytest.raises(ValueError):
+        store.grant("a", 1000, ["m1"], datetime.now(timezone.utc) + timedelta(hours=1),
+                    calibration_tau=bad)
+    assert len(store.ledger) == 0
+
+
+def test_grant_records_tau_default_and_custom():
+    store, p, r = _store_and_permit()
+    assert p.calibration_tau == TAU_DEFAULT
+    assert r.payload["calibration_tau"] == TAU_DEFAULT
+    store2, p2, r2 = _store_and_permit(calibration_tau=0.9)
+    assert p2.calibration_tau == 0.9 and r2.payload["calibration_tau"] == 0.9
+
+
+def test_delegated_child_starts_at_parent_tau():
+    store, p, _ = _store_and_permit()
+    store.raise_calibration_tau(p.permit_id, 0.9)
+    res = store.delegate(p.permit_id, "agent-2", 1000, ["m1"],
+                         datetime.now(timezone.utc) + timedelta(hours=1))
+    assert res.ok and res.permit.calibration_tau == 0.9
+
+
+def test_tau_change_never_changes_authority_decision():
+    """Raising tau to 1.0 (the max) leaves the 4-clause decision untouched."""
+    store, p, _ = _store_and_permit()
+    assert store.raise_calibration_tau(p.permit_id, 1.0).ok
+    r = store.check(p.permit_id, 500, "m1")
+    assert r.allowed and r.reason == "allowed"
+    r = store.check(p.permit_id, 500, "evil")
+    assert not r.allowed and r.reason == "merchant_not_allowed"
