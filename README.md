@@ -48,6 +48,7 @@ python trace.py                  # with server.py running: allow, block, delegat
 python demo_six_beat.py          # LLM agent: grant → capture → over-cap block → delegate + cascade → tampered evidence → timeout/reconcile
 python demo_delegation.py --fast # LLM agents: buyer and researcher, five beats, live dashboard
 python demo_approval.py --fast   # LLM agent: auto-allow, approve, deny, fail-closed
+python demo_admission.py         # offline: runaway loop refused at budget exhaustion, concurrent overspend cannot exceed cap
 ```
 
 The three LLM demos call the runner set by `PERMIT_GROK_CLI`. There is no default: if it is unset, the demo exits 1 with a `RuntimeError` that names the fix. `demo_six_beat.py` also takes `--replay <transcript>`, which replays the recorded reasoning and re-executes every recorded action against the live tools, fully offline. A live run records `demo_transcript.jsonl`. The file is gitignored, so a fresh clone has no transcript until you record one.
@@ -98,7 +99,7 @@ check → reserve cap → PayPal AUTHORIZE hold → escrow registered
 
 ## Evidence
 
-- **170 tests pass:** `python -m pytest -q`, run 2026-10-07 on `main` at `dc0f3a5`. CI runs the same suite plus `python demo.py` on every push.
+- **187 tests pass:** `python -m pytest -q`, run 2026-10-09 on the admission-gating branch (184 on main at 39a7a0c + 3 new). CI runs the same suite plus `python demo.py` on every push.
 - **Mock end-to-end demo:** `python demo.py` ends with `ledger chain: VERIFIED (15 receipts)` (run 2026-10-07 at `dc0f3a5`).
 - **Mock rail vs sandbox, kept separate:**
   - `demo_six_beat.py` runs on the mock rail, with no PayPal network or credentials. Its agent still needs `PERMIT_GROK_CLI` or a recorded transcript.
