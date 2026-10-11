@@ -96,15 +96,28 @@ class ReconcileResult:
     receipt: Receipt | None = None
 
 
-# Demo acceptance key. Hardcoded and labeled as such — no key-management scope.
-# In a real deployment this is the counterparty's key, never the worker's.
+# Acceptance key: the counterparty's key in production. Defaults to the
+# hardcoded demo key ONLY when PERMIT_ACCEPTANCE_KEY is unset, and says
+# so loudly — a payment authority layer must never silently run on a
+# demo key. (Audit item 12: env-provided keys now; KMS/HSM story next.)
+import os as _os
+
 DEMO_ACCEPTANCE_KEY = b"demo-acceptance-key-NOT-FOR-PRODUCTION"
+ACCEPTANCE_KEY = _os.environ.get("PERMIT_ACCEPTANCE_KEY", "").encode() or DEMO_ACCEPTANCE_KEY
+if ACCEPTANCE_KEY is DEMO_ACCEPTANCE_KEY:
+    import warnings as _warnings
+    _warnings.warn(
+        "PERMIT_ACCEPTANCE_KEY unset: running on the demo acceptance key. "
+        "Set PERMIT_ACCEPTANCE_KEY in any real deployment.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def sign_acceptance(escrow_id: str, artifact_hash: str, amount_cents: int) -> str:
     """What the counterparty (acceptance key holder) does off-camera."""
     msg = f"{escrow_id}|{artifact_hash}|{amount_cents}".encode()
-    return hmac.new(DEMO_ACCEPTANCE_KEY, msg, hashlib.sha256).hexdigest()
+    return hmac.new(ACCEPTANCE_KEY, msg, hashlib.sha256).hexdigest()
 
 
 class ReleaseVerifier:
@@ -136,6 +149,23 @@ class ReleaseVerifier:
                 "artifact_hash": escrow.artifact_hash,
             },
         )
+
+    def escrows_snapshot(self) -> list[dict]:
+        """
+        Read-only projection of all escrows for dashboards and operators.
+        Plain dicts, no live references — safe to serialize.
+        """
+        with self._lock:
+            escrows = list(self._escrows.values())
+        return [{
+            "escrow_id": e.escrow_id,
+            "permit_id": e.permit_id,
+            "amount_cents": e.amount_cents,
+            "merchant_id": e.merchant_id,
+            "predicate": e.predicate_type.value,
+            "state": e.state,
+            "paypal_auth_id": e.paypal_auth_id,
+        } for e in escrows]
 
     @staticmethod
     def _capture_key(escrow: Escrow) -> str:
