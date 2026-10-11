@@ -154,10 +154,7 @@ class SpendPipeline:
 
     def _find_check_receipt(self, auth_id: str) -> Receipt | None:
         """Locate the ALLOWED receipt for an outstanding auth_id, if any."""
-        for r in self.ledger.receipts():
-            if r.event_type == "ALLOWED" and r.payload.get("auth_id") == auth_id:
-                return r
-        return None
+        return self.ledger.allowed_receipt(auth_id)
 
     # -- spend ----------------------------------------------------------------
 

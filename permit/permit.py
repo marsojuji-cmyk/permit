@@ -61,6 +61,14 @@ class UnknownPermit(Exception):
     """Raised when an operation names a permit id the store does not hold."""
 
 
+class UnknownAuthId(Exception):
+    """
+    Raised when a settlement operation names an auth id with no live
+    reservation on the permit. An explicit exception (never assert):
+    trust-boundary behavior must be identical under `python -O`.
+    """
+
+
 # Delegation depth bound (converged from the level-up line): a delegation
 # tree cannot grow without limit. Depth 0 is a granted root; each carve
 # adds one. Delegation past this depth is BLOCKED, not raised.
@@ -891,10 +899,12 @@ class PermitStore:
     def settle_capture(self, permit_id: str, auth_id: str) -> Receipt:
         """Move a reservation to captured (called by the settlement layer)."""
         permit = self.get(permit_id)
-        assert permit is not None, "unknown permit"
+        if permit is None:
+            raise UnknownPermit(permit_id)
         with permit._lock:
             amount = permit.in_flight.pop(auth_id, None)
-            assert amount is not None, "unknown auth_id"
+            if amount is None:
+                raise UnknownAuthId(auth_id)
             permit.reserved_cents -= amount
             permit.captured_cents += amount
             receipt = self.ledger.append(
@@ -914,10 +924,12 @@ class PermitStore:
     def settle_void(self, permit_id: str, auth_id: str) -> Receipt:
         """Release a reservation (called by the settlement layer on void)."""
         permit = self.get(permit_id)
-        assert permit is not None, "unknown permit"
+        if permit is None:
+            raise UnknownPermit(permit_id)
         with permit._lock:
             amount = permit.in_flight.pop(auth_id, None)
-            assert amount is not None, "unknown auth_id"
+            if amount is None:
+                raise UnknownAuthId(auth_id)
             permit.reserved_cents -= amount
             return self.ledger.append(
                 "VOIDED",
@@ -1042,7 +1054,8 @@ class PermitStore:
         are closed by the per-permit lock + capture-time re-admission.
         """
         root = self.get(permit_id)
-        assert root is not None, "unknown permit"
+        if root is None:
+            raise UnknownPermit(permit_id)
         # Collect the subtree (parents before children) under the store lock.
         with self._store_lock:
             order = [permit_id]
@@ -1079,7 +1092,11 @@ class PermitStore:
                     )
                     if pid == permit_id:
                         root_receipt = receipt
-        assert root_receipt is not None, "root permit vanished"
+        if root_receipt is None:
+            # Unreachable: the root exists (checked above) and permits are
+            # never deleted, so the loop always visits it. Loud failure
+            # rather than an assert, so -O cannot silence it.
+            raise RuntimeError("root permit vanished during revoke_subtree")
         return root_receipt, in_flight
 
     def release_carve(self, permit_id: str) -> Receipt | None:
@@ -1108,7 +1125,16 @@ class PermitStore:
                     - permit.captured_cents
                     - permit.reserved_cents
                 )
-                assert unspent >= 0, "delegation carve accounting went negative"
+                if unspent < 0:
+                    raise RuntimeError(
+                        "delegation carve accounting went negative"
+                    )
+                if parent.reserved_cents < unspent:
+                    # Fail closed: the parent's books cannot cover the
+                    # carve being returned. Loud, no money moves.
+                    raise RuntimeError(
+                        "parent reserved cannot cover carve release"
+                    )
                 parent.reserved_cents -= unspent
                 parent_remaining = parent.remaining_cents()
                 parent_id = permit.parent_id

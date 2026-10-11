@@ -48,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from permit.flow import ApprovalRequired, SpendPipeline
 from permit.ledger import Ledger
-from permit.permit import PermitStore, UnknownPermit
+from permit.permit import PermitStore, UnknownAuthId, UnknownPermit
 from settlement.paypal_client import MockPayPalClient
 from settlement.verifier import (
     Evidence,
@@ -268,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             try:
                 receipt, voided = flow.estop(m.group(1))
-            except AssertionError:
+            except UnknownPermit:
                 return self._error(404, "unknown_permit")
             return self._send(200, {
                 "revoked": True, "voided_escrows": voided,
