@@ -164,6 +164,36 @@ def _authorized(handler: BaseHTTPRequestHandler) -> bool:
     return hmac.compare_digest(presented, token)
 
 
+# ---------------------------------------------------------------- logging
+
+import logging
+
+
+class _JsonFormatter(logging.Formatter):
+    """Single-line JSON per record: the operational log."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname.lower(),
+            "component": "permit-server",
+            "msg": record.getMessage(),
+        })
+
+
+def _configure_logging() -> logging.Logger:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JsonFormatter())
+    log = logging.getLogger("permit")
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    return log
+
+
+log = _configure_logging()
+
+
 def receipt_summary(r):
     return {"seq": r.seq, "event": r.event_type, "hash": r.hash[:12], "payload": r.payload}
 
@@ -485,12 +515,12 @@ def main():
         paypal = SandboxPayPalClient(client_id, client_secret,
                                      merchant_account_id=merchant_id)
         MOCK_MODE = False
-        print("permit: sandbox rail armed"
-              + (f" (merchant bound to {merchant_id})" if merchant_id
-                 else " (WARNING: no PERMIT_PAYPAL_MERCHANT_ID — merchant binding disabled)"))
+        log.info("sandbox rail armed"
+                 + (f" (merchant bound to {merchant_id})" if merchant_id
+                    else " (WARNING: no PERMIT_PAYPAL_MERCHANT_ID — merchant binding disabled)"))
     else:
         paypal = MockPayPalClient()
-        print("permit: mock rail (no network, no credentials)")
+        log.info("mock rail (no network, no credentials)")
 
     verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
@@ -501,7 +531,7 @@ def main():
     sweeper.start()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"permit: listening on 127.0.0.1:{args.port}")
+    log.info(f"listening on 127.0.0.1:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

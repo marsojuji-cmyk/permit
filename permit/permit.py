@@ -227,6 +227,37 @@ class PermitStore:
         with self._store_lock:
             return list(self._children.get(permit_id, []))
 
+    def permits_snapshot(self) -> list[dict]:
+        """
+        Read-only projection of all permits for dashboards and operators.
+        Plain dicts, no live references — safe to serialize. The dashboard
+        reads through this, never through _permits.
+        """
+        out = []
+        with self._store_lock:
+            permits = list(self._permits.values())
+        for p in permits:
+            with p._lock:
+                eff_cap = p.cap_cents
+                if (
+                    p.tighten_cap_cents is not None
+                    and p.tighten_cap_cents < eff_cap
+                ):
+                    eff_cap = p.tighten_cap_cents
+                out.append({
+                    "permit_id": p.permit_id,
+                    "agent_id": p.agent_id,
+                    "cap_cents": p.cap_cents,
+                    "effective_cap_cents": eff_cap,
+                    "reserved_cents": p.reserved_cents,
+                    "captured_cents": p.captured_cents,
+                    "remaining_cents": p.remaining_cents(),
+                    "revoked": p.revoked,
+                    "allowlist": list(p.allowlist),
+                    "parent_id": p.parent_id,
+                })
+        return out
+
     def delegate(
         self,
         parent_permit_id: str,
