@@ -999,7 +999,8 @@ class PermitStore:
         either before the recheck (capture refused) or after CAPTURED.
         """
         root = self.get(permit_id)
-        assert root is not None, "unknown permit"
+        if root is None:
+            raise UnknownPermit(permit_id)
         with self.settlement_gate:
             with root._lock:
                 root.revoked = True
