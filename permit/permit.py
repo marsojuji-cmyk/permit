@@ -170,6 +170,11 @@ class PermitStore:
         # Principal approvals: approval_id -> PendingApproval.
         self._approvals: dict[str, PendingApproval] = {}
         self._store_lock = threading.Lock()
+        # Settlement gate: serializes every revocation (estop, cascade)
+        # against the release-time admission recheck + provider capture.
+        # Lock order: gate -> store -> permit. Never taken while holding a
+        # store or permit lock.
+        self.settlement_gate = threading.RLock()
 
     def grant(
         self,
@@ -929,22 +934,94 @@ class PermitStore:
         Emergency stop: revoke the permit immediately. Returns the e-stop
         receipt and the in-flight authorization ids the settlement layer
         must void. No further check() can pass after this.
+
+        The e-stop cascades: every descendant permit is revoked too (see
+        estop_cascade()); use estop_cascade() to get the descendants'
+        in-flight holds as well.
         """
+        receipt, in_flight = self.estop_cascade(permit_id)
+        return receipt, in_flight.get(permit_id, [])
+
+    def estop_cascade(
+        self, permit_id: str
+    ) -> tuple[Receipt, dict[str, list[str]]]:
+        """
+        E-stop a permit and revoke every descendant (REVOKED_CASCADE
+        receipt each). Returns the E-STOP receipt and {permit_id:
+        [in-flight auth_ids]} for the root and every descendant with
+        holds, so the settlement layer can void in-flight child holds.
+
+        Runs under the settlement gate, so it is atomic with respect to
+        the release-time admission recheck + capture: an E-STOP receipt is
+        either before the recheck (capture refused) or after CAPTURED.
+        """
+        root = self.get(permit_id)
+        assert root is not None, "unknown permit"
+        with self.settlement_gate:
+            with root._lock:
+                root.revoked = True
+                root_ids = list(root.in_flight.keys())
+                receipt = self.ledger.append(
+                    "E-STOP",
+                    {
+                        "permit_id": permit_id,
+                        "agent_id": root.agent_id,
+                        "in_flight_auth_ids": root_ids,
+                        "reserved_cents_released": root.reserved_cents,
+                    },
+                )
+            in_flight: dict[str, list[str]] = {permit_id: root_ids}
+            with self._store_lock:
+                order: list[str] = []
+                queue = list(self._children.get(permit_id, []))
+                while queue:
+                    pid = queue.pop(0)
+                    order.append(pid)
+                    queue.extend(self._children.get(pid, []))
+            for pid in order:
+                permit = self.get(pid)
+                if permit is None:
+                    continue
+                with permit._lock:
+                    ids = list(permit.in_flight.keys())
+                    if ids:
+                        in_flight[pid] = ids
+                    if permit.revoked:
+                        continue
+                    permit.revoked = True
+                    self.ledger.append(
+                        "REVOKED_CASCADE",
+                        {
+                            "permit_id": pid,
+                            "agent_id": permit.agent_id,
+                            "in_flight_auth_ids": ids,
+                            "parent_id": permit.parent_id,
+                            "cascade_from": permit_id,
+                        },
+                    )
+        return receipt, in_flight
+
+    def release_block_reason(
+        self, permit_id: str, now: datetime | None = None
+    ) -> str | None:
+        """
+        Release-time admission: None if a hold on this permit may capture
+        now, else the fail-closed reason. Checks the permit AND every
+        ancestor for revocation/expiry. The settlement layer calls this
+        under settlement_gate immediately before the provider capture.
+        Caller must not hold any permit or store lock.
+        """
+        now = now or datetime.now(timezone.utc)
         permit = self.get(permit_id)
-        assert permit is not None, "unknown permit"
+        if permit is None:
+            return "unknown_permit"
+        chain = self.lineage(permit_id)
         with permit._lock:
-            permit.revoked = True
-            in_flight = list(permit.in_flight.keys())
-            receipt = self.ledger.append(
-                "E-STOP",
-                {
-                    "permit_id": permit_id,
-                    "agent_id": permit.agent_id,
-                    "in_flight_auth_ids": in_flight,
-                    "reserved_cents_released": permit.reserved_cents,
-                },
-            )
-            return receipt, in_flight
+            if permit.revoked:
+                return "revoked"
+            if now >= permit.expiry:
+                return "expired"
+        return self._lineage_block_reason(chain, now)
 
     def revoke_subtree(
         self, permit_id: str
@@ -977,29 +1054,31 @@ class PermitStore:
                     queue.append(cid)
         in_flight: dict[str, list[str]] = {}
         root_receipt: Receipt | None = None
-        for pid in order:
-            permit = self.get(pid)
-            if permit is None:
-                continue
-            with permit._lock:
-                ids = list(permit.in_flight.keys())
-                if ids:
-                    in_flight[pid] = ids
-                if permit.revoked:
+        # Under the settlement gate: atomic vs. release-time recheck + capture.
+        with self.settlement_gate:
+            for pid in order:
+                permit = self.get(pid)
+                if permit is None:
                     continue
-                permit.revoked = True
-                event = "E-STOP" if pid == permit_id else "REVOKED_CASCADE"
-                receipt = self.ledger.append(
-                    event,
-                    {
-                        "permit_id": pid,
-                        "agent_id": permit.agent_id,
-                        "in_flight_auth_ids": ids,
-                        "parent_id": permit.parent_id,
-                    },
-                )
-                if pid == permit_id:
-                    root_receipt = receipt
+                with permit._lock:
+                    ids = list(permit.in_flight.keys())
+                    if ids:
+                        in_flight[pid] = ids
+                    if permit.revoked:
+                        continue
+                    permit.revoked = True
+                    event = "E-STOP" if pid == permit_id else "REVOKED_CASCADE"
+                    receipt = self.ledger.append(
+                        event,
+                        {
+                            "permit_id": pid,
+                            "agent_id": permit.agent_id,
+                            "in_flight_auth_ids": ids,
+                            "parent_id": permit.parent_id,
+                        },
+                    )
+                    if pid == permit_id:
+                        root_receipt = receipt
         assert root_receipt is not None, "root permit vanished"
         return root_receipt, in_flight
 

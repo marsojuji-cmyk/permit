@@ -621,7 +621,13 @@ class SpendPipeline:
         Returns the e-stop receipt and the voided ids: escrow ids for
         registered escrows, permit auth_ids for outstanding unregistered
         holds.
+
+        The e-stop cascades: every descendant permit is revoked and its
+        in-flight holds are voided too (parent first, then descendants).
         """
-        receipt, in_flight_auth_ids = self.permits.estop(permit_id)
-        voided = self._void_permit_holds(permit_id, in_flight_auth_ids)
+        receipt, in_flight = self.permits.estop_cascade(permit_id)
+        voided = self._void_permit_holds(permit_id, in_flight.get(permit_id, []))
+        for pid, auth_ids in in_flight.items():
+            if pid != permit_id:
+                voided.extend(self._void_permit_holds(pid, auth_ids))
         return receipt, voided

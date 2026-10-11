@@ -166,6 +166,34 @@ class ReleaseVerifier:
 
         return False, "unknown_predicate"
 
+    def _refuse_admission(self, escrow: Escrow, admit_reason: str) -> VerifyResult:
+        """Fail-closed admission refusal: REFUSED receipt, void the hold.
+        Caller holds self._lock. Never calls capture."""
+        escrow_id = escrow.escrow_id
+        self.ledger.append(
+            "REFUSED", {"escrow_id": escrow_id, "reason": admit_reason}
+        )
+        try:
+            self.paypal.void(escrow.paypal_auth_id)
+        except PayPalTimeout:
+            # The void may or may not have applied: cleanup is
+            # pending, retry_cleanup() finishes it.
+            escrow.state = "CLEANUP_PENDING"
+            self.ledger.append(
+                "CLEANUP_PENDING",
+                {
+                    "escrow_id": escrow_id,
+                    "reason": admit_reason,
+                    "detail": "void_timeout",
+                },
+            )
+            return VerifyResult(False, admit_reason)
+        escrow.state = "VOIDED"
+        if self.permits.get(escrow.permit_id) is not None:
+            # settle_void appends the VOIDED receipt (shared ledger).
+            self.permits.settle_void(escrow.permit_id, escrow.auth_id)
+        return VerifyResult(False, admit_reason)
+
     def verify_and_capture(self, escrow_id: str, evidence: Evidence) -> VerifyResult:
         """
         Single-flight, fail-closed release. The ONLY path to capture.
@@ -191,42 +219,12 @@ class ReleaseVerifier:
             if escrow.state == "CLEANUP_PENDING":
                 return VerifyResult(False, "cleanup_pending")
 
-            # Admission recheck: the permit may have been revoked or
-            # expired after the hold was registered (e-stop race). Never
-            # capture into a dead permit — void the hold instead.
-            now = datetime.now(timezone.utc)
-            permit = self.permits.get(escrow.permit_id)
-            if permit is None or permit.revoked or now >= permit.expiry:
-                admit_reason = (
-                    "unknown_permit"
-                    if permit is None
-                    else "revoked"
-                    if permit.revoked
-                    else "expired"
-                )
-                self.ledger.append(
-                    "REFUSED", {"escrow_id": escrow_id, "reason": admit_reason}
-                )
-                try:
-                    self.paypal.void(escrow.paypal_auth_id)
-                except PayPalTimeout:
-                    # The void may or may not have applied: cleanup is
-                    # pending, retry_cleanup() finishes it.
-                    escrow.state = "CLEANUP_PENDING"
-                    self.ledger.append(
-                        "CLEANUP_PENDING",
-                        {
-                            "escrow_id": escrow_id,
-                            "reason": admit_reason,
-                            "detail": "void_timeout",
-                        },
-                    )
-                    return VerifyResult(False, admit_reason)
-                escrow.state = "VOIDED"
-                if permit is not None:
-                    # settle_void appends the VOIDED receipt (shared ledger).
-                    self.permits.settle_void(escrow.permit_id, escrow.auth_id)
-                return VerifyResult(False, admit_reason)
+            # Admission recheck: the permit (or any ancestor) may have been
+            # revoked or expired after the hold was registered (e-stop
+            # race). Never capture into a dead permit — void the hold.
+            admit_reason = self.permits.release_block_reason(escrow.permit_id)
+            if admit_reason is not None:
+                return self._refuse_admission(escrow, admit_reason)
 
             # Ledger chain must be intact before any money moves.
             ok, chain_reason = self.ledger.verify_chain()
@@ -285,83 +283,92 @@ class ReleaseVerifier:
                 self.permits.settle_void(escrow.permit_id, escrow.auth_id)
                 return VerifyResult(False, f"predicate:{pred_reason}")
 
-            # Predicate passed — single-flight idempotent capture.
-            key = self._capture_key(escrow)
-            try:
-                capture = self.paypal.capture(
-                    escrow.paypal_auth_id,
-                    escrow.amount_cents,
-                    idempotency_key=key,
-                )
-            except PayPalTimeout:
-                # The response was lost: the capture may or may not have
-                # applied. NEVER guess — mark UNKNOWN; reconcile() queries
-                # provider truth before anything else happens.
-                escrow.state = "UNKNOWN"
-                self.ledger.append(
-                    "UNKNOWN",
-                    {
-                        "escrow_id": escrow_id,
-                        "reason": "capture_timeout",
-                        "idempotency_key": key,
-                    },
-                )
-                return VerifyResult(False, "unknown_after_timeout")
+            # Predicate passed. Release-time admission recheck, atomic with
+            # the capture: under the settlement gate no e-stop/revocation
+            # can land between this recheck and the CAPTURED receipt. An
+            # e-stop on the permit OR any ancestor that landed while the
+            # predicate was evaluated refuses the capture and voids the hold.
+            with self.permits.settlement_gate:
+                late_reason = self.permits.release_block_reason(escrow.permit_id)
+                if late_reason is None:
+                    # Single-flight idempotent capture.
+                    key = self._capture_key(escrow)
+                    try:
+                        capture = self.paypal.capture(
+                            escrow.paypal_auth_id,
+                            escrow.amount_cents,
+                            idempotency_key=key,
+                        )
+                    except PayPalTimeout:
+                        # The response was lost: the capture may or may not have
+                        # applied. NEVER guess — mark UNKNOWN; reconcile() queries
+                        # provider truth before anything else happens.
+                        escrow.state = "UNKNOWN"
+                        self.ledger.append(
+                            "UNKNOWN",
+                            {
+                                "escrow_id": escrow_id,
+                                "reason": "capture_timeout",
+                                "idempotency_key": key,
+                            },
+                        )
+                        return VerifyResult(False, "unknown_after_timeout")
 
-            if capture.status == "PENDING":
-                # Provider accepted the capture but has not completed it:
-                # the obligation is retained (reservation still held)
-                # until reconcile() sees completed provider truth.
-                escrow.state = "UNKNOWN"
-                self.ledger.append(
-                    "UNKNOWN",
-                    {
-                        "escrow_id": escrow_id,
-                        "reason": "capture_pending",
-                        "paypal_capture_id": capture.capture_id,
-                        "idempotency_key": key,
-                    },
-                )
-                return VerifyResult(False, "capture_pending")
+                    if capture.status == "PENDING":
+                        # Provider accepted the capture but has not completed it:
+                        # the obligation is retained (reservation still held)
+                        # until reconcile() sees completed provider truth.
+                        escrow.state = "UNKNOWN"
+                        self.ledger.append(
+                            "UNKNOWN",
+                            {
+                                "escrow_id": escrow_id,
+                                "reason": "capture_pending",
+                                "paypal_capture_id": capture.capture_id,
+                                "idempotency_key": key,
+                            },
+                        )
+                        return VerifyResult(False, "capture_pending")
 
-            if capture.status != "COMPLETED":
-                # Provider refused the capture: unwind the hold fail-closed.
-                self.ledger.append(
-                    "FAILED",
-                    {
-                        "escrow_id": escrow_id,
-                        "paypal_capture_id": capture.capture_id,
-                        "status": capture.status,
-                    },
-                )
-                try:
-                    self.paypal.void(escrow.paypal_auth_id)
-                except PayPalTimeout:
-                    escrow.state = "CLEANUP_PENDING"
+                    if capture.status != "COMPLETED":
+                        # Provider refused the capture: unwind the hold fail-closed.
+                        self.ledger.append(
+                            "FAILED",
+                            {
+                                "escrow_id": escrow_id,
+                                "paypal_capture_id": capture.capture_id,
+                                "status": capture.status,
+                            },
+                        )
+                        try:
+                            self.paypal.void(escrow.paypal_auth_id)
+                        except PayPalTimeout:
+                            escrow.state = "CLEANUP_PENDING"
+                            self.ledger.append(
+                                "CLEANUP_PENDING",
+                                {
+                                    "escrow_id": escrow_id,
+                                    "reason": "capture_failed",
+                                    "detail": "void_timeout",
+                                },
+                            )
+                            return VerifyResult(False, "capture_failed")
+                        escrow.state = "VOIDED"
+                        self.permits.settle_void(escrow.permit_id, escrow.auth_id)
+                        return VerifyResult(False, "capture_failed")
+
+                    escrow.state = "CAPTURED"
+                    self.permits.settle_capture(escrow.permit_id, escrow.auth_id)
                     self.ledger.append(
-                        "CLEANUP_PENDING",
+                        "CAPTURED",
                         {
                             "escrow_id": escrow_id,
-                            "reason": "capture_failed",
-                            "detail": "void_timeout",
+                            "paypal_capture_id": capture.capture_id,
+                            "amount_cents": escrow.amount_cents,
                         },
                     )
-                    return VerifyResult(False, "capture_failed")
-                escrow.state = "VOIDED"
-                self.permits.settle_void(escrow.permit_id, escrow.auth_id)
-                return VerifyResult(False, "capture_failed")
-
-            escrow.state = "CAPTURED"
-            self.permits.settle_capture(escrow.permit_id, escrow.auth_id)
-            self.ledger.append(
-                "CAPTURED",
-                {
-                    "escrow_id": escrow_id,
-                    "paypal_capture_id": capture.capture_id,
-                    "amount_cents": escrow.amount_cents,
-                },
-            )
-            return VerifyResult(True, "released", capture)
+                    return VerifyResult(True, "released", capture)
+            return self._refuse_admission(escrow, late_reason)
 
     def reconcile(self, escrow_id: str) -> ReconcileResult:
         """
