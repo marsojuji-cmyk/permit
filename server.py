@@ -498,9 +498,12 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- main
 
 def main():
-    global paypal, verifier, flow, MOCK_MODE
+    global paypal, verifier, flow, MOCK_MODE, ledger, permits
     ap = argparse.ArgumentParser(description="Permit service")
     ap.add_argument("--port", type=int, default=8741)
+    ap.add_argument("--db", type=str, default=None,
+                    help="SQLite path for the durable receipt ledger;"
+                         " default is in-memory (no persistence)")
     ap.add_argument("--sandbox", action="store_true",
                     help="use the real sandbox rail (needs env creds + interactive payer approval)")
     args = ap.parse_args()
@@ -524,6 +527,20 @@ def main():
 
     verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
     flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+
+    if args.db:
+        # Durable mode: open (verifying) the SQLite ledger, then fold the
+        # restored chain into the permit store. SqliteLedger.__init__
+        # raises instead of serving a corrupt chain — fail closed.
+        from permit.sqlite_ledger import SqliteLedger, fold_receipts
+        db_ledger = SqliteLedger(args.db)
+        folded = fold_receipts(db_ledger.receipts())
+        folded.ledger = db_ledger
+        ledger, permits = db_ledger, folded
+        verifier = ReleaseVerifier(paypal, permits, ledger=ledger)
+        flow = SpendPipeline(permits, paypal, verifier, ledger=ledger)
+        log.info(f"durable ledger at {args.db}"
+                 f" ({len(ledger)} receipts restored)")
 
     # Reap TTL-expired payer-approval operations (daemon; 60s cadence).
     # /resume also reaps on hit, so an expired op never captures.
