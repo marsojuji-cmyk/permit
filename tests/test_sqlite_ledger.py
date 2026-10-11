@@ -12,11 +12,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
 from permit.ledger import GENESIS_HASH, Ledger
 from permit.sqlite_ledger import SqliteLedger
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -153,7 +156,7 @@ def test_kill9_mid_append_chain_verifies_or_refuses(tmp_path):
             "    l.append('NOISE', {'i': i, 'pad': 'x' * 200}); i += 1",
             db_path,
         ],
-        cwd="/home/hatch/workspace/permit-main",
+        cwd=str(REPO_ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
